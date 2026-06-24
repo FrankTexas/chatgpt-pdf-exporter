@@ -1,15 +1,74 @@
-build/
-dist/
+﻿# ==============================
+# Dependencies
+# ==============================
+node_modules/
+**/node_modules/
 
+# ==============================
+# Browser profiles / login state / cookies / cache
+# DO NOT upload these
+# ==============================
 chrome_data/
 my_browser_data/
+chrome-profile/
+chrome-profile-debug/
+**/chrome_data/
+**/my_browser_data/
+**/chrome-profile/
+**/chrome-profile-debug/
+**/Crashpad/
+**/BrowserMetrics*
+**/*.pma
 
+# ==============================
+# Captured ChatGPT data / logs / output
+# ==============================
+captures/
+logs/
+output/
+**/captures/
+**/logs/
+**/output/
+
+# ==============================
+# Exported files
+# ==============================
+*.pdf
+*.html
+**/*.pdf
+**/*.html
+
+# ==============================
+# Old files / backup / test scripts
+# ==============================
+_old_files/
+**/_old_files/
+*.bak
+*.bak_*
+*_backup*
+patch_*.js
+repair_*.js
+capture_test.js
+test_connect.js
+parse_conversation.js
+parsed_preview.md
+
+# ==============================
+# Python cache
+# ==============================
 __pycache__/
 *.pyc
 
-*.pdf
-*.exe
-*.spec
+# ==============================
+# Local config / env
+# ==============================
+.env
+.env.*
+*.local
 
-.vscode/
-.cursor/
+# ==============================
+# OS files
+# ==============================
+.DS_Store
+Thumbs.db
+desktop.ini
