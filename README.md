@@ -386,6 +386,56 @@ pip install -r requirements.txt
 * 一键启动和导出
 * 自动选择 ChatGPT 页面
 * 导出 Markdown 或 Word 文档
+## 当前推荐使用方式
+
+本项目目前推荐使用 Node.js 版本进行导出。
+
+### 一键选择窗口并导出
+
+双击运行：
+
+```text
+RUN_FRESH_EXPORT_SELECT.bat
+```
+
+程序会自动检查运行环境，并列出当前 Chrome 中打开的页面。用户只需要输入需要导出的 ChatGPT 对话页面编号，程序会自动完成：
+
+```text
+选择窗口
+抓取最新 conversation JSON
+检查 JSON 是否有效
+生成 PDF 和 HTML
+输出到指定文件夹
+```
+
+### 修改 PDF 输出目录
+
+如需更改 PDF 保存位置，双击运行：
+
+```text
+CHANGE_PDF_OUTPUT_DIR.bat
+```
+
+选择新的输出文件夹后，程序会记住该路径。
+
+### 不要上传的本地数据
+
+以下目录和文件只用于本地运行，不能上传到 GitHub：
+
+```text
+chrome_data/
+chrome-profile/
+chrome-profile-debug/
+captures/
+logs/
+output/
+node_modules/
+_old_files/
+*.pdf
+*.html
+```
+
+其中 `chrome-profile`、`chrome-profile-debug`、`chrome_data` 可能包含浏览器缓存、Cookie 和登录状态；`captures` 可能包含完整 ChatGPT 对话 JSON；`output` 中包含导出的 PDF 和 HTML。
 
 ---
 
