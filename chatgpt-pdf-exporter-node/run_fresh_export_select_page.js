@@ -1,9 +1,10 @@
-﻿const fs = require("fs");
+const fs = require("fs");
 const path = require("path");
 const childProcess = require("child_process");
-const puppeteer = require("puppeteer-core");
+let puppeteer = null;
 
-const ROOT = process.cwd();
+// 用脚本所在目录作为项目目录，避免用户从别的目录启动时路径错乱。
+const ROOT = __dirname;
 const CAPTURE_DIR = path.join(ROOT, "captures");
 const LOG_DIR = path.join(ROOT, "logs");
 
@@ -11,6 +12,101 @@ fs.mkdirSync(CAPTURE_DIR, { recursive: true });
 fs.mkdirSync(LOG_DIR, { recursive: true });
 
 const LOG_FILE = path.join(LOG_DIR, "fresh_export_select_log.txt");
+
+const REQUIRED_RUNTIME_DEPS = ["puppeteer-core"];
+
+function npmCommand() {
+  return process.platform === "win32" ? "npm.cmd" : "npm";
+}
+
+function hasCommand(cmd, args = ["--version"]) {
+  const result = childProcess.spawnSync(cmd, args, {
+    cwd: ROOT,
+    stdio: "ignore",
+    shell: false
+  });
+
+  return !result.error && result.status === 0;
+}
+
+function canResolvePackage(packageName) {
+  try {
+    require.resolve(packageName, { paths: [ROOT] });
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+function assertSupportedNode() {
+  const major = Number(String(process.versions.node || "0").split(".")[0]);
+
+  if (!Number.isFinite(major) || major < 18) {
+    throw new Error(
+      "当前 Node.js 版本过低：" + process.version + "。请安装 Node.js 18 LTS 或更高版本后再运行。"
+    );
+  }
+}
+
+function ensureDependencies() {
+  const missing = REQUIRED_RUNTIME_DEPS.filter(dep => !canResolvePackage(dep));
+  const nodeModulesDir = path.join(ROOT, "node_modules");
+  const packageJsonPath = path.join(ROOT, "package.json");
+  const shouldInstall = missing.length > 0 || !fs.existsSync(nodeModulesDir);
+
+  if (!shouldInstall) {
+    ok("依赖检查通过");
+    return;
+  }
+
+  warn("检测到首次运行或依赖缺失。缺少依赖：" + (missing.join(", ") || "node_modules"));
+  warn("正在自动安装依赖，请保持网络畅通。首次运行可能需要 1-5 分钟。");
+
+  const npm = npmCommand();
+
+  if (!hasCommand(npm)) {
+    throw new Error("找不到 npm。请重新安装 Node.js 18 LTS 或更高版本，并确认安装时勾选 npm。");
+  }
+
+  const args = fs.existsSync(packageJsonPath)
+    ? ["install", "--no-audit", "--no-fund"]
+    : ["install", "--no-audit", "--no-fund", ...REQUIRED_RUNTIME_DEPS];
+
+  log("执行命令：" + npm + " " + args.join(" "));
+
+  const result = childProcess.spawnSync(npm, args, {
+    cwd: ROOT,
+    stdio: "inherit",
+    shell: false
+  });
+
+  if (result.error) {
+    throw new Error("依赖安装启动失败：" + result.error.message);
+  }
+
+  if (result.status !== 0) {
+    throw new Error(
+      "依赖安装失败。你可以在项目目录手动执行：npm install --no-audit --no-fund"
+    );
+  }
+
+  const stillMissing = REQUIRED_RUNTIME_DEPS.filter(dep => !canResolvePackage(dep));
+
+  if (stillMissing.length > 0) {
+    throw new Error("依赖安装后仍缺少：" + stillMissing.join(", "));
+  }
+
+  ok("依赖安装完成");
+}
+
+function loadPuppeteer() {
+  if (!puppeteer) {
+    ensureDependencies();
+    puppeteer = require(require.resolve("puppeteer-core", { paths: [ROOT] }));
+  }
+
+  return puppeteer;
+}
 
 function log(...args) {
   const line = args.join(" ");
@@ -115,7 +211,9 @@ async function startChromeIfNeeded() {
 }
 
 async function connectBrowser() {
-  const browser = await puppeteer.connect({
+  const puppeteerCore = loadPuppeteer();
+
+  const browser = await puppeteerCore.connect({
     browserURL: "http://127.0.0.1:9222",
     defaultViewport: null
   });
@@ -533,6 +631,8 @@ async function main() {
   log("");
 
   ok("Node 版本：" + process.version);
+  assertSupportedNode();
+  ensureDependencies();
 
   await startChromeIfNeeded();
 
