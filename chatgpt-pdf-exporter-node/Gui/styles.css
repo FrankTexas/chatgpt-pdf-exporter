@@ -1,0 +1,124 @@
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: "Microsoft YaHei", "Segoe UI", Arial, sans-serif;
+  background: #f5f5f5;
+  color: #222;
+}
+
+.app {
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: 24px;
+}
+
+.hero {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 20px;
+}
+
+h1 {
+  margin: 0 0 8px;
+  font-size: 30px;
+}
+
+p {
+  margin: 0;
+  color: #666;
+}
+
+.status {
+  padding: 8px 14px;
+  border-radius: 999px;
+  background: #ddd;
+  white-space: nowrap;
+}
+
+.status.running {
+  background: #d8f5df;
+  color: #146b2c;
+}
+
+.panel,
+.log-panel {
+  background: #fff;
+  border: 1px solid #ddd;
+  border-radius: 14px;
+  padding: 18px;
+  margin-bottom: 18px;
+}
+
+.buttons,
+.input-row,
+.log-title {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+}
+
+button {
+  border: 0;
+  border-radius: 10px;
+  padding: 10px 16px;
+  cursor: pointer;
+  background: #222;
+  color: #fff;
+  font-size: 14px;
+}
+
+button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+#stopBtn {
+  background: #8a1f1f;
+}
+
+#openOutputBtn,
+#clearBtn {
+  background: #555;
+}
+
+.input-row {
+  margin-top: 14px;
+}
+
+input {
+  flex: 1;
+  padding: 11px 12px;
+  border: 1px solid #ccc;
+  border-radius: 10px;
+  font-size: 14px;
+}
+
+.hint {
+  margin-top: 10px;
+  font-size: 13px;
+}
+
+.log-title {
+  justify-content: space-between;
+  margin-bottom: 12px;
+  font-weight: 700;
+}
+
+#log {
+  height: 380px;
+  overflow: auto;
+  margin: 0;
+  padding: 14px;
+  border-radius: 10px;
+  background: #111;
+  color: #eee;
+  font-family: Consolas, "Courier New", monospace;
+  font-size: 13px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+}

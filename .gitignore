@@ -72,3 +72,11 @@ __pycache__/
 .DS_Store
 Thumbs.db
 desktop.ini
+# ==============================
+node_modules/
+*.log
+fresh_export_select_log.txt
+pdf_output_config.json
+pdf_output_dir.txt
+*.pdf
+chatgpt_export_*.json

@@ -1,58 +1,65 @@
-﻿const fs = require("fs");
+const fs = require("fs");
 const path = require("path");
-const sanitize = require("sanitize-filename");
-const MarkdownIt = require("markdown-it");
-const puppeteer = require("puppeteer-core");
+const childProcess = require("child_process");
+let puppeteer = null;
 
-const ROOT = process.cwd();
-const INPUT = path.join(ROOT, "captures", "conversation_json.txt");
-const OUTPUT_DIR = path.join(ROOT, "output");
+let MarkdownIt = null;
+try {
+  MarkdownIt = require("markdown-it");
+} catch (_) {}
 
-const md = new MarkdownIt({
-  html: false,
-  linkify: true,
-  breaks: false,
-});
+const md = MarkdownIt
+  ? new MarkdownIt({
+      html: false,
+      linkify: true,
+      breaks: false
+    })
+  : null;
 
-function log(msg) {
-  console.log(msg);
+const ROOT = __dirname;
+const CAPTURE_DIR = path.join(ROOT, "captures");
+const DEFAULT_JSON_PATH = path.join(CAPTURE_DIR, "conversation_json.txt");
+const DEFAULT_OUTPUT_DIR = path.join(ROOT, "output");
+
+function log(...args) {
+  console.log(args.join(" "));
 }
 
-function ok(msg) {
-  console.log("✅ " + msg);
+function safeFilename(name, fallback = "chatgpt_export") {
+  const raw = String(name || fallback)
+    .replace(/[\\/:*?"<>|]/g, "_")
+    .replace(/[\r\n\t]+/g, " ")
+    .trim();
+  return raw || fallback;
 }
 
-function fail(msg) {
-  console.log("❌ " + msg);
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
 }
 
-function escapeHtml(str) {
-  return String(str || "")
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#039;");
+function pathToFileUrl(filePath) {
+  const resolved = path.resolve(filePath).replace(/\\/g, "/");
+  return "file:///" + encodeURI(resolved);
 }
 
 function extractJsonText(raw) {
   raw = String(raw || "");
-
-  if (raw.trim().startsWith("{")) {
-    return raw.trim();
-  }
-
+  if (raw.trim().startsWith("{")) return raw.trim();
   const idx = raw.indexOf("\n{");
-  if (idx >= 0) {
-    return raw.slice(idx + 1).trim();
-  }
-
+  if (idx >= 0) return raw.slice(idx + 1).trim();
   const first = raw.indexOf("{");
-  if (first >= 0) {
-    return raw.slice(first).trim();
-  }
-
+  if (first >= 0) return raw.slice(first).trim();
   return "";
+}
+
+function readConversation(jsonPath = DEFAULT_JSON_PATH) {
+  const raw = fs.readFileSync(jsonPath, "utf8");
+  return JSON.parse(extractJsonText(raw));
 }
 
 function getCurrentBranch(data) {
@@ -80,6 +87,26 @@ function getCurrentBranch(data) {
   return chain.reverse();
 }
 
+function contentText(content) {
+  if (!content) return "";
+  if (typeof content === "string") return content;
+  if (content.text) return String(content.text);
+
+  if (Array.isArray(content.parts)) {
+    return content.parts.map(part => {
+      if (typeof part === "string") return part;
+      if (part && typeof part === "object") {
+        // 附件对象不要直接输出 file_id，后面单独用附件卡片渲染。
+        if (part.file_id || part.fileId || part.asset_pointer || part.name || part.filename || part.file_name) return "";
+        if (part.text) return part.text;
+      }
+      return "";
+    }).filter(Boolean).join("\n");
+  }
+
+  return "";
+}
+
 function looksInternalToolMessage(msg) {
   const role = msg.author?.role || "";
   const raw = JSON.stringify(msg.content || {});
@@ -88,7 +115,6 @@ function looksInternalToolMessage(msg) {
   const contentType = msg.content?.content_type || "";
 
   if (role !== "assistant") return false;
-
   if (channel && channel !== "final") return true;
   if (recipient && recipient !== "all") return true;
 
@@ -107,87 +133,149 @@ function looksInternalToolMessage(msg) {
 
   if (toolKeys.some(k => raw.includes(k))) return true;
 
-  if (contentType && !["text", "multimodal_text"].includes(contentType)) {
-    return true;
-  }
-
+  if (contentType && !["text", "multimodal_text"].includes(contentType)) return true;
   return false;
 }
 
-function extractTextAndMedia(content, msg) {
-  const result = {
-    text: "",
-    media: []
+function isImageLike(name, mimeType) {
+  const n = String(name || "").toLowerCase();
+  const m = String(mimeType || "").toLowerCase();
+  return m.startsWith("image/") || /\.(jpg|jpeg|png|webp|gif|bmp|svg)$/i.test(n);
+}
+
+function normalizeAttachment(raw) {
+  if (!raw || typeof raw !== "object") return null;
+
+  const fileId = raw.file_id || raw.fileId || raw.id || raw.fileID || "";
+  const name = raw.name || raw.file_name || raw.filename || raw.display_name || raw.title || "";
+  const mimeType = raw.mime_type || raw.mimeType || raw.content_type || raw.contentType || raw.type || "";
+
+  if (!fileId && !name) return null;
+
+  return {
+    fileId: String(fileId || ""),
+    name: String(name || ""),
+    mimeType: String(mimeType || ""),
+    isImage: isImageLike(name, mimeType)
   };
+}
 
-  if (!content) return result;
+function collectAttachmentsFromMessage(msg) {
+  const list = [];
+  const seen = new Set();
 
-  if (typeof content === "string") {
-    result.text = content;
-    return result;
+  function push(record) {
+    if (!record) return;
+    const key = (record.fileId || "") + "|" + (record.name || "");
+    if (seen.has(key)) return;
+    seen.add(key);
+    list.push(record);
   }
 
-  if (content.text) {
-    result.text += content.text;
+  const metaAttachments = Array.isArray(msg.metadata?.attachments) ? msg.metadata.attachments : [];
+  for (const a of metaAttachments) push(normalizeAttachment(a));
+
+  const parts = Array.isArray(msg.content?.parts) ? msg.content.parts : [];
+  for (const part of parts) {
+    if (part && typeof part === "object") push(normalizeAttachment(part));
   }
 
-  if (Array.isArray(content.parts)) {
-    for (const part of content.parts) {
-      if (typeof part === "string") {
-        result.text += part;
-        continue;
-      }
+  return list;
+}
 
-      if (!part || typeof part !== "object") continue;
+function loadAssetsManifest(jsonPath) {
+  const candidates = [
+    path.join(path.dirname(jsonPath), "assets_manifest.json"),
+    path.join(CAPTURE_DIR, "assets_manifest.json")
+  ];
 
-      if (part.text) {
-        result.text += part.text;
-      }
+  for (const p of candidates) {
+    if (!fs.existsSync(p)) continue;
+    try {
+      const manifest = JSON.parse(fs.readFileSync(p, "utf8"));
+      manifest.__path = p;
+      return manifest;
+    } catch (_) {}
+  }
 
-      const raw = JSON.stringify(part);
-      const fileMatch = raw.match(/file_[a-zA-Z0-9]+/);
-      const fileId = fileMatch ? fileMatch[0] : "";
-      const name = part.name || part.file_name || part.filename || fileId || "";
+  return { filesById: {}, filesByName: {}, allSavedImages: [] };
+}
 
-      if (fileId || name) {
-        const isImage =
-          String(part.mime_type || "").startsWith("image/") ||
-          String(part.content_type || "").startsWith("image/") ||
-          String(name).match(/\.(png|jpe?g|webp|gif)$/i);
+function findAssetForAttachment(att, manifest) {
+  if (!att || !manifest) return null;
+  const byId = manifest.filesById || {};
+  const byName = manifest.filesByName || {};
 
-        result.media.push({
-          type: isImage ? "image" : "file",
-          fileId,
-          name: name || fileId || "附件"
-        });
-      }
+  if (att.fileId && byId[att.fileId]) return byId[att.fileId];
+  if (att.name && byName[att.name]) return byName[att.name];
+
+  return null;
+}
+
+function assetSrc(asset) {
+  if (!asset) return "";
+  if (asset.fileUrl) return asset.fileUrl;
+  if (asset.localPath && fs.existsSync(asset.localPath)) return pathToFileUrl(asset.localPath);
+  return "";
+}
+
+function renderMarkdownish(text) {
+  const value = String(text || "");
+
+  if (md) {
+    return `<div class="markdown">${md.render(value)}</div>`;
+  }
+
+  let html = escapeHtml(value);
+
+  // 简单处理代码块，避免全部挤成一坨。不是完整 Markdown 解析器，但够稳定。
+  html = html.replace(/```([\s\S]*?)```/g, (_m, code) => {
+    return `<pre class="code-block"><code>${code}</code></pre>`;
+  });
+
+  html = html
+    .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+    .replace(/\n{2,}/g, "</p><p>")
+    .replace(/\n/g, "<br>");
+
+  return `<div class="markdown"><p>${html}</p></div>`;
+}
+
+function renderAttachment(att, manifest) {
+  const asset = findAssetForAttachment(att, manifest);
+  const name = att.name || "未命名附件";
+
+  if (att.isImage && asset) {
+    const src = assetSrc(asset);
+    if (src) {
+      return `
+        <div class="media-list">
+          <div class="file-chip image-chip">
+            <img src="${escapeHtml(src)}" alt="${escapeHtml(name)}" />
+          </div>
+        </div>`;
     }
   }
 
-  const attachments = msg.metadata?.attachments || [];
-
-  for (const a of attachments) {
-    const raw = JSON.stringify(a);
-    const fileMatch = raw.match(/file_[a-zA-Z0-9]+/);
-    const fileId = a.file_id || a.id || (fileMatch ? fileMatch[0] : "");
-    const name = a.name || a.file_name || a.filename || fileId || "附件";
-    const mime = a.mime_type || a.mimeType || a.content_type || "";
-
-    const isImage =
-      String(mime).startsWith("image/") ||
-      String(name).match(/\.(png|jpe?g|webp|gif)$/i);
-
-    result.media.push({
-      type: isImage ? "image" : "file",
-      fileId,
-      name
-    });
+  if (att.isImage) {
+    return `
+      <div class="media-list">
+        <div class="file-chip image-missing">
+          <small>图片未能嵌入，只保留附件记录。</small>
+          ${att.fileId ? `<br><small>${escapeHtml(att.fileId)}</small>` : ""}
+        </div>
+      </div>`;
   }
 
-  return result;
+  return `
+    <div class="media-list">
+      <div class="file-chip">
+        附件：${escapeHtml(name)}
+      </div>
+    </div>`;
 }
 
-function extractMessages(data) {
+function buildMessages(data, manifest) {
   const branch = getCurrentBranch(data);
   const messages = [];
 
@@ -195,88 +283,148 @@ function extractMessages(data) {
     const msg = node.message;
     if (!msg) continue;
 
-    if (msg.metadata?.is_visually_hidden_from_conversation) {
-      continue;
-    }
+    const role = msg.author?.role || "unknown";
+    if (!["user", "assistant"].includes(role)) continue;
+    if (msg.metadata?.is_visually_hidden_from_conversation) continue;
+    if (looksInternalToolMessage(msg)) continue;
 
-    if (looksInternalToolMessage(msg)) {
-      continue;
-    }
-
-    const role = msg.author?.role || "";
-
-    if (!["user", "assistant"].includes(role)) {
-      continue;
-    }
-
-    const extracted = extractTextAndMedia(msg.content, msg);
-    const text = String(extracted.text || "").trim();
-
-    const seen = new Set();
-    const media = [];
-
-    for (const item of extracted.media) {
-      const key = item.type + ":" + item.fileId + ":" + item.name;
-      if (seen.has(key)) continue;
-      seen.add(key);
-      media.push(item);
-    }
-
-    if (!text && media.length === 0) continue;
+    const text = contentText(msg.content).trim();
+    const attachments = collectAttachmentsFromMessage(msg);
+    if (!text && attachments.length === 0) continue;
 
     messages.push({
       role,
       text,
-      media
+      attachments,
+      createTime: msg.create_time || 0
     });
   }
 
   return messages;
 }
 
-function renderMedia(media) {
-  if (!media || media.length === 0) return "";
 
-  return `
-    <div class="media-list">
-      ${media.map(item => {
-        if (item.type === "image") {
-          return `
-            <div class="file-chip image-missing">
-              图片/附件记录：${escapeHtml(item.name || item.fileId || "图片")}
-              ${item.fileId ? `<br><small>${escapeHtml(item.fileId)}</small>` : ""}
-            </div>
-          `;
-        }
+function cleanDisplayNameForPdf(value) {
+  let s = String(value || "")
+    .replace(/\s+/g, " ")
+    .trim();
 
-        return `
-          <div class="file-chip">
-            附件：${escapeHtml(item.name || item.fileId || "文件")}
-          </div>
-        `;
-      }).join("")}
-    </div>
-  `;
+  if (!s) return "";
+
+  const planPatterns = [
+    /免费版升级.*$/i,
+    /升级.*$/i,
+    /free\s*plan\s*upgrade.*$/i,
+    /free\s*upgrade.*$/i,
+    /upgrade\s*plan.*$/i,
+    /plus\s*upgrade.*$/i,
+    /go\s*upgrade.*$/i,
+    /pro\s*upgrade.*$/i,
+    /team\s*upgrade.*$/i,
+    /enterprise\s*upgrade.*$/i,
+    /免费版.*$/i,
+    /free\s*plan.*$/i,
+    /plus\s*plan.*$/i,
+    /go\s*plan.*$/i,
+    /pro\s*plan.*$/i,
+    /team\s*plan.*$/i,
+    /enterprise\s*plan.*$/i
+  ];
+
+  for (const r of planPatterns) {
+    s = s.replace(r, "").trim();
+  }
+
+  s = s
+    .replace(/[|｜·•\-–—]\s*(免费版|升级|free|upgrade|plus|go|pro|team|enterprise).*$/i, "")
+    .trim();
+
+  const lower = s.toLowerCase();
+  const badContains = [
+    "打开",
+    "菜单",
+    "个人资料",
+    "账户",
+    "账号",
+    "profile",
+    "account",
+    "menu",
+    "settings",
+    "logout",
+    "log out",
+    "sign out",
+    "upgrade",
+    "new chat",
+    "chatgpt",
+    "openai"
+  ];
+
+  if (badContains.some(k => lower.includes(k))) return "";
+  if (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(s)) return "";
+  if (s.length < 2 || s.length > 40) return "";
+
+  return s;
 }
 
-function renderMessage(message) {
-  const roleName = message.role === "user" ? "用户" : "ChatGPT";
-  const roleClass = message.role === "user" ? "user" : "assistant";
+function readConfiguredDisplayNameForPdf() {
+  const fromEnv = cleanDisplayNameForPdf(process.env.CHATGPT_EXPORT_USER_NAME || process.env.PDF_USER_NAME || "");
+  if (fromEnv) return fromEnv;
 
-  const body = [
-    message.text ? `<div class="markdown">${md.render(message.text)}</div>` : "",
-    renderMedia(message.media)
-  ].join("");
+  const candidates = [
+    path.join(ROOT, "pdf_user_name.txt"),
+    path.join(ROOT, "user_name.txt"),
+    path.join(ROOT, "display_name.txt")
+  ];
 
-  return `
-    <article class="message ${roleClass}">
-      <div class="role">${roleName}</div>
-      <div class="content">${body}</div>
-    </article>
-  `;
+  for (const p of candidates) {
+    try {
+      if (!fs.existsSync(p)) continue;
+      const name = cleanDisplayNameForPdf(fs.readFileSync(p, "utf8").replace(/^\uFEFF/, ""));
+      if (name) return name;
+    } catch (_) {}
+  }
+
+  return "";
 }
 
-function buildHtml(title, messages) {
+function getExportUserName(manifest) {
+  const configured = readConfiguredDisplayNameForPdf();
+  if (configured) return configured;
+
+  const name = cleanDisplayNameForPdf(
+    manifest?.userDisplayName ||
+    manifest?.exportMetadata?.userDisplayName ||
+    ""
+  );
+
+  return name || "用户";
+}
+
+function formatExportTimeOnly() {
+  return new Date().toLocaleString("zh-CN");
+}
+
+function buildHtml(data, messages, manifest) {
+  const title = data.title || "ChatGPT 对话记录";
+  const generatedAt = formatExportTimeOnly();
+  const exportUserName = getExportUserName(manifest);
+
+  const body = messages.map(message => {
+    const roleName = message.role === "user" ? exportUserName : "ChatGPT";
+    const roleClass = message.role === "user" ? "user" : "assistant";
+    const textHtml = message.text ? renderMarkdownish(message.text) : "";
+    const attachmentsHtml = message.attachments.map(a => renderAttachment(a, manifest)).join("\n");
+
+    return `
+      <article class="message ${roleClass}">
+        <div class="role">${escapeHtml(roleName)}</div>
+        <div class="content">
+          ${textHtml}
+          ${attachmentsHtml}
+        </div>
+      </article>`;
+  }).join("\n");
+
   return `<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -379,7 +527,8 @@ function buildHtml(title, messages) {
     color: #374151;
   }
 
-  pre {
+  pre,
+  .code-block {
     white-space: pre-wrap;
     word-break: break-word;
     background: #f9fafb;
@@ -432,8 +581,27 @@ function buildHtml(title, messages) {
     color: #374151;
   }
 
+  .file-chip-title {
+    font-weight: 700;
+    margin-bottom: 8px;
+  }
+
   .file-chip small {
     color: #6b7280;
+  }
+
+  .image-chip {
+    page-break-inside: avoid;
+  }
+
+  .image-chip img {
+    display: block;
+    max-width: 100%;
+    max-height: 720px;
+    margin-top: 8px;
+    border-radius: 8px;
+    border: 1px solid #e5e7eb;
+    object-fit: contain;
   }
 
   @page {
@@ -449,17 +617,31 @@ function buildHtml(title, messages) {
     .page {
       max-width: none;
     }
+
+    .image-chip img {
+      max-height: 680px;
+    }
   }
 </style>
 </head>
 <body>
   <main class="page">
     <h1 class="title">${escapeHtml(title)}</h1>
-    <div class="meta">由 captures\\conversation_json.txt 生成</div>
-    ${messages.map(renderMessage).join("\n")}
+    <div class="meta">${escapeHtml(generatedAt)}</div>
+    ${body}
   </main>
 </body>
 </html>`;
+}
+
+async function ensurePuppeteer() {
+  if (puppeteer) return puppeteer;
+  try {
+    puppeteer = require("puppeteer-core");
+    return puppeteer;
+  } catch (e) {
+    throw new Error("找不到 puppeteer-core，请先运行 npm install。原始错误：" + e.message);
+  }
 }
 
 function findChrome() {
@@ -468,108 +650,109 @@ function findChrome() {
     path.join(process.env["ProgramFiles(x86)"] || "", "Google", "Chrome", "Application", "chrome.exe"),
     path.join(process.env.LOCALAPPDATA || "", "Google", "Chrome", "Application", "chrome.exe")
   ];
-
-  for (const p of candidates) {
-    if (p && fs.existsSync(p)) return p;
-  }
-
+  for (const p of candidates) if (p && fs.existsSync(p)) return p;
   return null;
 }
 
-async function main() {
-  log("读取文件：");
-  log(INPUT);
-  log("");
-
-  if (!fs.existsSync(INPUT)) {
-    fail("找不到 captures\\conversation_json.txt");
-    log("");
-    log("请先双击 RUN_ALL_CAPTURE_CHECK.bat 抓取聊天 JSON。");
-    process.exit(1);
-  }
-
-  fs.mkdirSync(OUTPUT_DIR, { recursive: true });
-
-  const raw = fs.readFileSync(INPUT, "utf8");
-  const jsonText = extractJsonText(raw);
-
-  const data = JSON.parse(jsonText);
-
-  if (!data.mapping) {
-    throw new Error("conversation_json.txt 中没有 mapping，不能生成 PDF。");
-  }
-
-  const title = data.title || "ChatGPT 对话记录";
-  const messages = extractMessages(data);
-
-  log("标题：" + title);
-  log("可导出消息数：" + messages.length);
-
-  if (messages.length <= 0) {
-    throw new Error("没有可导出的 user / assistant 消息。");
-  }
-
-  const safeTitle = sanitize(title).slice(0, 80) || "chatgpt";
-  const timestamp = new Date()
-    .toISOString()
-    .replaceAll(":", "-")
-    .replace(/\.\d+Z$/, "");
-
-  const baseName = safeTitle + "_" + timestamp;
-
-  const htmlPath = path.join(OUTPUT_DIR, baseName + ".html");
-  const pdfPath = path.join(OUTPUT_DIR, baseName + ".pdf");
-
-  const html = buildHtml(title, messages);
-
-  fs.writeFileSync(htmlPath, html, "utf8");
-
-  ok("HTML 已生成：");
-  log(htmlPath);
-
+async function htmlToPdf(htmlPath, pdfPath) {
+  const pp = await ensurePuppeteer();
   const chrome = findChrome();
+  if (!chrome) throw new Error("找不到 Google Chrome，无法生成 PDF。");
 
-  if (!chrome) {
-    throw new Error("找不到 Chrome，无法生成 PDF。");
-  }
-
-  log("");
-  log("正在生成 PDF...");
-
-  const browser = await puppeteer.launch({
+  const browser = await pp.launch({
     executablePath: chrome,
     headless: "new",
-    args: [
-      "--no-sandbox",
-      "--disable-setuid-sandbox"
-    ]
+    args: ["--no-first-run", "--no-default-browser-check"]
   });
 
-  const page = await browser.newPage();
-
-  await page.setContent(html, {
-    waitUntil: "networkidle0"
-  });
-
-  await page.pdf({
-    path: pdfPath,
-    format: "A4",
-    printBackground: true,
-    preferCSSPageSize: true
-  });
-
-  await browser.close();
-
-  ok("PDF 已生成：");
-  log(pdfPath);
-
-  log("");
-  log("SUCCESS");
+  try {
+    const page = await browser.newPage();
+    await page.goto(pathToFileUrl(htmlPath), { waitUntil: "networkidle0", timeout: 120000 });
+    await page.pdf({
+      path: pdfPath,
+      format: "A4",
+      printBackground: true,
+      margin: { top: "14mm", right: "12mm", bottom: "14mm", left: "12mm" }
+    });
+  } finally {
+    await browser.close().catch(() => {});
+  }
 }
 
-main().catch(err => {
-  console.error("");
-  console.error("FAILED");
-  console.error(err.stack || err.message || String(err));
-  process.exit(1);
-});
+function resolveOutputDir(argvOutputDir) {
+  if (argvOutputDir) return path.resolve(argvOutputDir);
+
+  const candidates = [
+    "pdf_output_dir.txt",
+    "output_dir.txt",
+    "output_path.txt",
+    "selected_output_dir.txt"
+  ].map(x => path.join(ROOT, x));
+
+  for (const p of candidates) {
+    if (!fs.existsSync(p)) continue;
+    const v = fs.readFileSync(p, "utf8").trim();
+    if (v) return v;
+  }
+
+  const jsonCandidates = ["config.json", "output_config.json", "pdf_output_config.json"].map(x => path.join(ROOT, x));
+  for (const p of jsonCandidates) {
+    if (!fs.existsSync(p)) continue;
+    try {
+      const cfg = JSON.parse(fs.readFileSync(p, "utf8"));
+      const v = cfg.outputDir || cfg.output_dir || cfg.pdfOutputDir || cfg.pdf_output_dir;
+      if (v) return v;
+    } catch (_) {}
+  }
+
+  return DEFAULT_OUTPUT_DIR;
+}
+
+async function convertJsonToPdf(options = {}) {
+  const jsonPath = path.resolve(options.jsonPath || DEFAULT_JSON_PATH);
+  const outputDir = path.resolve(resolveOutputDir(options.outputDir));
+
+  log("读取文件：" + jsonPath);
+  log("输出文件夹：" + outputDir);
+
+  fs.mkdirSync(outputDir, { recursive: true });
+
+  const data = readConversation(jsonPath);
+  const manifest = loadAssetsManifest(jsonPath);
+  const messages = buildMessages(data, manifest);
+
+  const title = safeFilename(data.title || "ChatGPT对话", "ChatGPT对话");
+  const stamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d+Z$/, "").replace("T", "_");
+  const base = `${title}_${stamp}`;
+  const htmlPath = path.join(outputDir, base + ".html");
+  const pdfPath = path.join(outputDir, base + ".pdf");
+
+  log("生成 HTML：" + htmlPath);
+  const html = buildHtml(data, messages, manifest);
+  fs.writeFileSync(htmlPath, html, "utf8");
+
+  log("生成 PDF：" + pdfPath);
+  await htmlToPdf(htmlPath, pdfPath);
+
+  log("完成：" + pdfPath);
+  return { htmlPath, pdfPath, messageCount: messages.length };
+}
+
+async function main() {
+  const jsonPath = process.argv[2] && !process.argv[2].startsWith("--") ? process.argv[2] : DEFAULT_JSON_PATH;
+  const outputDir = process.argv[3] && !process.argv[3].startsWith("--") ? process.argv[3] : undefined;
+  await convertJsonToPdf({ jsonPath, outputDir });
+}
+
+if (require.main === module) {
+  main().catch(err => {
+    console.error("PDF 生成失败：");
+    console.error(err.stack || err.message || String(err));
+    process.exit(1);
+  });
+}
+
+module.exports = convertJsonToPdf;
+module.exports.convertJsonToPdf = convertJsonToPdf;
+module.exports.main = main;
+module.exports.buildHtml = buildHtml;

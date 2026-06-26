@@ -1,206 +1,323 @@
-﻿const fs = require("fs");
+const fs = require("fs");
 const path = require("path");
-const os = require("os");
 const childProcess = require("child_process");
 
-const ROOT = process.cwd();
+const ROOT = __dirname;
+const DEFAULT_JSON = path.join(ROOT, "captures", "conversation_json.txt");
 const DEFAULT_OUTPUT = path.join(ROOT, "output");
-const CONFIG_DIR = path.join(process.env.APPDATA || os.homedir(), "chatgpt_pdf_exporter_node");
-const CONFIG_FILE = path.join(CONFIG_DIR, "selected_output_dir.json");
+const OUTPUT_TEXT_FILE = path.join(ROOT, "pdf_output_dir.txt");
+const OUTPUT_JSON_FILE = path.join(ROOT, "pdf_output_config.json");
 
-function log(msg) {
-  console.log(msg);
+function log(...args) {
+  console.log(args.join(" "));
 }
 
-function chooseFolder(defaultDir) {
+function warn(...args) {
+  console.log("⚠️ ", args.join(" "));
+}
+
+function ok(...args) {
+  console.log("✅", args.join(" "));
+}
+
+function readTextIfExists(p) {
+  try {
+    if (fs.existsSync(p)) return fs.readFileSync(p, "utf8").trim();
+  } catch (_) {}
+  return "";
+}
+
+function stripBom(s) {
+  return String(s || "").replace(/^\uFEFF/, "");
+}
+
+function stripOuterQuotes(s) {
+  let v = stripBom(s).trim();
+
+  while (
+    (v.startsWith('"') && v.endsWith('"')) ||
+    (v.startsWith("'") && v.endsWith("'"))
+  ) {
+    v = v.slice(1, -1).trim();
+  }
+
+  return v;
+}
+
+function expandEnvVars(s) {
+  let v = String(s || "");
+
+  v = v.replace(/%([^%]+)%/g, (_, name) => {
+    return process.env[name] || process.env[name.toUpperCase()] || process.env[name.toLowerCase()] || "";
+  });
+
+  if (v === "~") {
+    return process.env.USERPROFILE || process.env.HOME || v;
+  }
+
+  if (v.startsWith("~\\") || v.startsWith("~/")) {
+    const home = process.env.USERPROFILE || process.env.HOME || "";
+    if (home) return path.join(home, v.slice(2));
+  }
+
+  return v;
+}
+
+function normalizeOutputDir(input) {
+  let v = stripOuterQuotes(input);
+  if (!v) return "";
+
+  // 支持 file:///C:/Users/... 这种形式。
+  if (/^file:\/\//i.test(v)) {
+    try {
+      v = decodeURIComponent(new URL(v).pathname);
+      if (process.platform === "win32" && /^\/[a-zA-Z]:\//.test(v)) {
+        v = v.slice(1);
+      }
+    } catch (_) {}
+  }
+
+  v = expandEnvVars(v);
+
+  // 兼容用户从资源管理器复制的路径，去掉结尾空格和多余斜杠。
+  v = v.trim();
+
+  if (!v) return "";
+
+  return path.resolve(v);
+}
+
+function saveOutputDir(dir) {
+  const normalized = normalizeOutputDir(dir);
+  if (!normalized) return "";
+
+  fs.writeFileSync(OUTPUT_TEXT_FILE, normalized + "\n", "utf8");
+  fs.writeFileSync(
+    OUTPUT_JSON_FILE,
+    JSON.stringify({ outputDir: normalized, updatedAt: new Date().toISOString() }, null, 2),
+    "utf8"
+  );
+
+  return normalized;
+}
+
+function readSavedOutputDir() {
+  const textFiles = [
+    "pdf_output_dir.txt",
+    "output_dir.txt",
+    "output_path.txt",
+    "selected_output_dir.txt"
+  ];
+
+  for (const f of textFiles) {
+    const v = readTextIfExists(path.join(ROOT, f));
+    const normalized = normalizeOutputDir(v);
+    if (normalized) return normalized;
+  }
+
+  const jsonFiles = [
+    "pdf_output_config.json",
+    "config.json",
+    "output_config.json",
+    "pdf_output_config.json"
+  ];
+
+  for (const f of jsonFiles) {
+    const p = path.join(ROOT, f);
+    if (!fs.existsSync(p)) continue;
+
+    try {
+      const cfg = JSON.parse(fs.readFileSync(p, "utf8"));
+      const v = cfg.outputDir || cfg.output_dir || cfg.pdfOutputDir || cfg.pdf_output_dir;
+      const normalized = normalizeOutputDir(v);
+      if (normalized) return normalized;
+    } catch (_) {}
+  }
+
+  return "";
+}
+
+function getArgValue(names) {
+  const args = process.argv.slice(2);
+
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+
+    for (const name of names) {
+      if (a === name && args[i + 1]) return args[i + 1];
+      if (a.startsWith(name + "=")) return a.slice(name.length + 1);
+    }
+  }
+
+  return "";
+}
+
+function hasArg(name) {
+  return process.argv.slice(2).includes(name);
+}
+
+function powershellEncode(command) {
+  return Buffer.from(command, "utf16le").toString("base64");
+}
+
+function pickOutputDirViaPowerShell(initialDir) {
+  if (process.platform !== "win32") return "";
+
+  const safeInitial = String(initialDir || DEFAULT_OUTPUT).replace(/'/g, "''");
+
   const ps = `
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 Add-Type -AssemblyName System.Windows.Forms
 $dialog = New-Object System.Windows.Forms.FolderBrowserDialog
-$dialog.Description = "请选择 PDF 输出文件夹"
+$dialog.Description = "请选择 PDF 保存文件夹"
 $dialog.ShowNewFolderButton = $true
-$default = $env:CHATGPT_PDF_DEFAULT_DIR
-if ($default -and (Test-Path $default)) {
-  $dialog.SelectedPath = $default
+$initial = '${safeInitial}'
+if ($initial -and (Test-Path -LiteralPath $initial)) {
+  $dialog.SelectedPath = $initial
 }
 $result = $dialog.ShowDialog()
 if ($result -eq [System.Windows.Forms.DialogResult]::OK) {
-  [Console]::Write($dialog.SelectedPath)
+  Write-Output $dialog.SelectedPath
 }
 `;
 
+  const exe = process.env.SystemRoot
+    ? path.join(process.env.SystemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe")
+    : "powershell.exe";
+
   try {
-    return childProcess.execFileSync(
-      "powershell.exe",
-      ["-STA", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps],
+    const r = childProcess.spawnSync(
+      exe,
+      [
+        "-NoProfile",
+        "-STA",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-EncodedCommand",
+        powershellEncode(ps)
+      ],
       {
+        cwd: ROOT,
         encoding: "utf8",
-        env: {
-          ...process.env,
-          CHATGPT_PDF_DEFAULT_DIR: defaultDir,
-        },
+        windowsHide: false,
+        timeout: 5 * 60 * 1000
       }
-    ).trim();
-  } catch {
+    );
+
+    const out = stripOuterQuotes((r.stdout || "").trim().split(/\r?\n/).filter(Boolean).pop() || "");
+    return normalizeOutputDir(out);
+  } catch (_) {
     return "";
   }
 }
 
-function getSavedOutputDir() {
-  try {
-    if (!fs.existsSync(CONFIG_FILE)) return "";
-    const cfg = JSON.parse(fs.readFileSync(CONFIG_FILE, "utf8"));
-    if (cfg.outputDir && fs.existsSync(cfg.outputDir)) return cfg.outputDir;
-  } catch {}
-  return "";
-}
+function resolveOutputDir(options = {}) {
+  const forcePicker = !!options.forcePicker;
+  const allowPicker = options.allowPicker !== false;
 
-function saveOutputDir(dir) {
-  fs.mkdirSync(CONFIG_DIR, { recursive: true });
-  fs.writeFileSync(
-    CONFIG_FILE,
-    JSON.stringify({ outputDir: dir, updatedAt: new Date().toISOString() }, null, 2),
-    "utf8"
-  );
-}
+  const cliValue = getArgValue(["--output", "--output-dir", "--out"]);
+  const cliDir = normalizeOutputDir(cliValue);
+  if (cliDir) return { dir: cliDir, source: "command line" };
 
-function getOutputDir() {
-  const forceChange = process.argv.includes("--change-output-dir");
+  const envValue = process.env.PDF_OUTPUT_DIR || process.env.CHATGPT_PDF_OUTPUT_DIR || "";
+  const envDir = normalizeOutputDir(envValue);
+  if (envDir) return { dir: envDir, source: "environment variable" };
 
-  const saved = getSavedOutputDir();
+  const savedDir = readSavedOutputDir();
+  const defaultDir = DEFAULT_OUTPUT;
 
-  if (!forceChange && saved) {
-    return saved;
-  }
+  if (allowPicker && process.platform === "win32" && (forcePicker || !savedDir)) {
+    log("");
+    log("请选择 PDF 保存文件夹...");
+    log("如果取消，将使用默认 output 文件夹。");
 
-  log("请选择 PDF 输出文件夹...");
+    const picked = pickOutputDirViaPowerShell(savedDir || defaultDir);
 
-  const selected = chooseFolder(saved || DEFAULT_OUTPUT);
-
-  const finalDir = selected || saved || DEFAULT_OUTPUT;
-
-  fs.mkdirSync(finalDir, { recursive: true });
-  saveOutputDir(finalDir);
-
-  return finalDir;
-}
-
-function listFiles(dir) {
-  if (!fs.existsSync(dir)) return [];
-
-  return fs.readdirSync(dir)
-    .filter(name => /\.(pdf|html)$/i.test(name))
-    .map(name => {
-      const full = path.join(dir, name);
-      const stat = fs.statSync(full);
-      return { name, full, mtimeMs: stat.mtimeMs };
-    });
-}
-
-function moveNewFiles(fromDir, toDir, startedAt) {
-  if (!fs.existsSync(fromDir)) return [];
-
-  const moved = [];
-
-  const files = listFiles(fromDir).filter(f => f.mtimeMs >= startedAt - 3000);
-
-  for (const f of files) {
-    const target = path.join(toDir, f.name);
-
-    if (path.resolve(f.full).toLowerCase() === path.resolve(target).toLowerCase()) {
-      moved.push(target);
-      continue;
+    if (picked) {
+      const saved = saveOutputDir(picked);
+      return { dir: saved, source: "folder picker" };
     }
 
-    fs.mkdirSync(toDir, { recursive: true });
-
-    let finalTarget = target;
-    if (fs.existsSync(finalTarget)) {
-      const ext = path.extname(f.name);
-      const base = path.basename(f.name, ext);
-      finalTarget = path.join(toDir, `${base}_${Date.now()}${ext}`);
-    }
-
-    fs.renameSync(f.full, finalTarget);
-    moved.push(finalTarget);
+    warn("你取消了文件夹选择。");
   }
 
-  return moved;
+  if (savedDir) return { dir: savedDir, source: "saved config" };
+
+  return { dir: defaultDir, source: "default" };
+}
+
+async function chooseOutputOnly() {
+  log("========================================");
+  log("修改 PDF 保存位置");
+  log("========================================");
+
+  const current = readSavedOutputDir() || DEFAULT_OUTPUT;
+
+  log("");
+  log("当前保存位置：");
+  log(current);
+
+  const picked = pickOutputDirViaPowerShell(current);
+
+  if (!picked) {
+    warn("未选择文件夹，保存位置没有变化。");
+    return;
+  }
+
+  const saved = saveOutputDir(picked);
+  fs.mkdirSync(saved, { recursive: true });
+
+  ok("PDF 保存位置已更新：");
+  log(saved);
+  log("");
+  log("配置文件：");
+  log(OUTPUT_TEXT_FILE);
 }
 
 async function main() {
+  if (hasArg("--choose-output-only") || hasArg("--set-output")) {
+    await chooseOutputOnly();
+    return;
+  }
+
   log("========================================");
   log("JSON To PDF - 选择输出位置版");
   log("========================================");
   log("");
 
-  if (!fs.existsSync(path.join(ROOT, "captures", "conversation_json.txt"))) {
-    log("❌ 找不到 captures\\conversation_json.txt");
-    log("请先运行 RUN_ALL_CAPTURE_CHECK.bat 抓取聊天 JSON。");
-    process.exit(1);
+  if (!fs.existsSync(DEFAULT_JSON)) {
+    throw new Error("找不到 conversation_json.txt：" + DEFAULT_JSON);
   }
 
-  if (!fs.existsSync(path.join(ROOT, "json_to_pdf.js"))) {
-    log("❌ 找不到 json_to_pdf.js");
-    process.exit(1);
-  }
+  const resultDir = resolveOutputDir({
+    allowPicker: process.env.CHATGPT_PDF_OUTPUT_PICKER !== "0"
+  });
 
-  const outputDir = getOutputDir();
+  const outputDir = normalizeOutputDir(resultDir.dir);
+  fs.mkdirSync(outputDir, { recursive: true });
 
   log("输出文件夹：");
   log(outputDir);
+  log("来源：" + resultDir.source);
   log("");
-
-  const startedAt = Date.now();
-
   log("开始生成 PDF...");
   log("");
 
-  const result = childProcess.spawnSync(
-    "node",
-    [path.join(ROOT, "json_to_pdf.js")],
-    {
-      cwd: ROOT,
-      stdio: "inherit",
-      env: {
-        ...process.env,
-        CHATGPT_PDF_OUTPUT_DIR: outputDir,
-      },
-      shell: false,
-    }
-  );
-
-  if (result.status !== 0) {
-    log("");
-    log("❌ json_to_pdf.js 运行失败。");
-    process.exit(result.status || 1);
-  }
+  const convertJsonToPdf = require("./json_to_pdf.js");
+  const result = await convertJsonToPdf({
+    jsonPath: DEFAULT_JSON,
+    outputDir
+  });
 
   log("");
-  log("开始整理输出文件...");
-
-  const moved = moveNewFiles(DEFAULT_OUTPUT, outputDir, startedAt);
-
-  if (moved.length > 0) {
-    log("");
-    log("✅ 已输出到：");
-    for (const f of moved) {
-      log(f);
-    }
-  } else {
-    log("");
-    log("⚠️ 没在默认 output 目录发现新 PDF/HTML。");
-    log("如果文件已经出现在你选择的目录，可以忽略这条提示。");
-    log("你也可以检查默认目录：");
-    log(DEFAULT_OUTPUT);
-  }
-
-  log("");
-  log("SUCCESS");
+  log("生成完成：");
+  log(result.pdfPath);
+  log(result.htmlPath);
 }
 
 main().catch(err => {
   console.error("");
-  console.error("FAILED");
+  console.error("PDF 生成失败：");
   console.error(err.stack || err.message || String(err));
   process.exit(1);
 });
