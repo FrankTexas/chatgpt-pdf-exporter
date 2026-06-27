@@ -20,6 +20,14 @@ const ROOT = __dirname;
 const CAPTURE_DIR = path.join(ROOT, "captures");
 const DEFAULT_JSON_PATH = path.join(CAPTURE_DIR, "conversation_json.txt");
 const DEFAULT_OUTPUT_DIR = path.join(ROOT, "output");
+const MATHJAX_CDN_SRC = "https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-svg.js";
+
+let mathJaxRuntimeChecked = false;
+let mathJaxScriptSrc = "";
+let mathJaxRuntimeSource = "";
+let mathJaxRuntimeOk = false;
+
+const MATHJAX_RUNTIME_CONFIG_FILE = path.join(ROOT, "mathjax_runtime_config.json");
 
 function log(...args) {
   console.log(args.join(" "));
@@ -85,6 +93,430 @@ function getCurrentBranch(data) {
   }
 
   return chain.reverse();
+}
+
+
+function npmCommand() {
+  return process.platform === "win32" ? "npm.cmd" : "npm";
+}
+
+function npmRun(args, options = {}) {
+  const stdio = options.stdio || "pipe";
+  const encoding = options.encoding || "utf8";
+  const attempts = [];
+  const nodeDir = path.dirname(process.execPath || "");
+
+  const npmCliCandidates = [
+    process.env.npm_execpath,
+    path.join(nodeDir, "node_modules", "npm", "bin", "npm-cli.js")
+  ].filter(Boolean);
+
+  for (const npmCli of npmCliCandidates) {
+    try {
+      if (fs.existsSync(npmCli) && npmCli.toLowerCase().endsWith(".js")) {
+        attempts.push({
+          cmd: process.execPath,
+          args: [npmCli, ...args],
+          shell: false
+        });
+      }
+    } catch (_) {}
+  }
+
+  const npmCmdCandidates = [
+    path.join(nodeDir, process.platform === "win32" ? "npm.cmd" : "npm"),
+    process.platform === "win32" ? "npm.cmd" : "npm",
+    "npm"
+  ];
+
+  for (const npmCmd of npmCmdCandidates) {
+    attempts.push({
+      cmd: npmCmd,
+      args,
+      shell: false
+    });
+  }
+
+  attempts.push({
+    cmd: "npm",
+    args,
+    shell: process.platform === "win32"
+  });
+
+  let lastResult = null;
+
+  for (const attempt of attempts) {
+    try {
+      const result = childProcess.spawnSync(attempt.cmd, attempt.args, {
+        cwd: ROOT,
+        stdio,
+        encoding,
+        shell: attempt.shell
+      });
+
+      lastResult = result;
+
+      if (!result.error && result.status === 0) {
+        return { ok: true, result };
+      }
+    } catch (err) {
+      lastResult = { error: err, status: -1, stdout: "", stderr: String(err && (err.stack || err.message) || err) };
+    }
+  }
+
+  return { ok: false, result: lastResult };
+}
+
+function canResolvePackage(packageName) {
+  try {
+    require.resolve(packageName, { paths: [ROOT] });
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+function ensureMathJaxPackage(logger = log) {
+  if (canResolvePackage("mathjax")) return true;
+
+  try {
+    logger("MathJax SVG：本地未安装，正在安装一次...");
+    const npmInstall = npmRun(["install", "--no-audit", "--no-fund", "mathjax@3"], {
+      stdio: "pipe",
+      encoding: "utf8"
+    });
+
+    const result = npmInstall.result || { status: -1, stdout: "", stderr: "" };
+
+    if (!npmInstall.ok) {
+      const detail = [
+        "status=" + String(result.status),
+        "error=" + String(result.error && (result.error.message || result.error) || ""),
+        result.stdout || "",
+        result.stderr || ""
+      ].join("\n").trim();
+
+      if (detail) {
+        logger("MathJax SVG：npm 安装失败，已改用 CDN。详细信息见开发者日志。");
+        try {
+          fs.mkdirSync(path.join(ROOT, "logs"), { recursive: true });
+          fs.appendFileSync(
+            path.join(ROOT, "logs", "pdf_generation_dev_log.txt"),
+            "\n[MathJax npm install failed]\n" + detail + "\n",
+            "utf8"
+          );
+        } catch (_) {}
+      }
+
+      return false;
+    }
+
+    return canResolvePackage("mathjax");
+  } catch (err) {
+    logger("MathJax SVG：npm 安装异常，已改用 CDN。");
+    try {
+      fs.mkdirSync(path.join(ROOT, "logs"), { recursive: true });
+      fs.appendFileSync(
+        path.join(ROOT, "logs", "pdf_generation_dev_log.txt"),
+        "\n[MathJax npm install exception]\n" + String(err && (err.stack || err.message) || err) + "\n",
+        "utf8"
+      );
+    } catch (_) {}
+    return false;
+  }
+}
+
+
+function readMathJaxRuntimeConfig() {
+  try {
+    if (!fs.existsSync(MATHJAX_RUNTIME_CONFIG_FILE)) return null;
+    const cfg = JSON.parse(fs.readFileSync(MATHJAX_RUNTIME_CONFIG_FILE, "utf8"));
+
+    if (cfg && cfg.source === "local" && cfg.scriptPath && fs.existsSync(cfg.scriptPath)) {
+      return {
+        source: "local",
+        scriptPath: cfg.scriptPath,
+        scriptSrc: pathToFileUrl(cfg.scriptPath)
+      };
+    }
+
+    if (cfg && cfg.source === "cdn" && cfg.scriptSrc) {
+      return {
+        source: "cdn",
+        scriptPath: "",
+        scriptSrc: cfg.scriptSrc
+      };
+    }
+  } catch (_) {}
+
+  return null;
+}
+
+function saveMathJaxRuntimeConfig(config) {
+  try {
+    fs.writeFileSync(
+      MATHJAX_RUNTIME_CONFIG_FILE,
+      JSON.stringify(
+        {
+          ...config,
+          updatedAt: new Date().toISOString()
+        },
+        null,
+        2
+      ),
+      "utf8"
+    );
+  } catch (_) {}
+}
+
+function resolveLocalMathJaxScriptPath() {
+  try {
+    return require.resolve("mathjax/es5/tex-svg.js", { paths: [ROOT] });
+  } catch (_) {
+    return "";
+  }
+}
+
+function checkMathJaxRuntime(logger = log) {
+  if (mathJaxRuntimeChecked) {
+    logger("MathJax SVG：已就绪（" + mathJaxRuntimeSource + "）");
+    return mathJaxRuntimeOk;
+  }
+
+  mathJaxRuntimeChecked = true;
+  logger("检测 MathJax SVG 公式渲染...");
+
+  const cached = readMathJaxRuntimeConfig();
+  if (cached && cached.source === "local") {
+    mathJaxScriptSrc = cached.scriptSrc;
+    mathJaxRuntimeSource = "本地";
+    mathJaxRuntimeOk = true;
+    logger("MathJax SVG：本地缓存检测成功");
+    return true;
+  }
+
+  if (cached && cached.source === "cdn") {
+    mathJaxScriptSrc = cached.scriptSrc;
+    mathJaxRuntimeSource = "CDN";
+    mathJaxRuntimeOk = false;
+    logger("MathJax SVG：使用已保存的 CDN 方案");
+    return false;
+  }
+
+  const existingScriptPath = resolveLocalMathJaxScriptPath();
+  if (existingScriptPath && fs.existsSync(existingScriptPath)) {
+    mathJaxScriptSrc = pathToFileUrl(existingScriptPath);
+    mathJaxRuntimeSource = "本地";
+    mathJaxRuntimeOk = true;
+    saveMathJaxRuntimeConfig({
+      source: "local",
+      scriptPath: existingScriptPath,
+      scriptSrc: mathJaxScriptSrc
+    });
+    logger("MathJax SVG：本地加载成功");
+    return true;
+  }
+
+  const installed = ensureMathJaxPackage(logger);
+  if (installed) {
+    const installedScriptPath = resolveLocalMathJaxScriptPath();
+
+    if (installedScriptPath && fs.existsSync(installedScriptPath)) {
+      mathJaxScriptSrc = pathToFileUrl(installedScriptPath);
+      mathJaxRuntimeSource = "本地";
+      mathJaxRuntimeOk = true;
+      saveMathJaxRuntimeConfig({
+        source: "local",
+        scriptPath: installedScriptPath,
+        scriptSrc: mathJaxScriptSrc
+      });
+      logger("MathJax SVG：安装并加载成功");
+      return true;
+    }
+  }
+
+  mathJaxScriptSrc = MATHJAX_CDN_SRC;
+  mathJaxRuntimeSource = "CDN";
+  mathJaxRuntimeOk = false;
+  saveMathJaxRuntimeConfig({
+    source: "cdn",
+    scriptPath: "",
+    scriptSrc: mathJaxScriptSrc
+  });
+  logger("MathJax SVG：本地不可用，已保存 CDN 方案");
+  return false;
+}
+
+function getMathJaxScriptSrc() {
+  if (!mathJaxRuntimeChecked) {
+    checkMathJaxRuntime();
+  }
+
+  return mathJaxScriptSrc || MATHJAX_CDN_SRC;
+}
+
+function isFormulaLike(expr) {
+  const s = String(expr || "").trim();
+  if (!s) return false;
+  if (s.length > 2500) return false;
+
+  return (
+    /\\[a-zA-Z]+/.test(s) ||
+    /[=^_]/.test(s) ||
+    /\b(f|g|h|z|u|v|x|y|r|t|s)\s*\(/.test(s) ||
+    /\b(sin|cos|tan|ln|log|exp)\b/.test(s)
+  );
+}
+
+function renderMathBlock(expr) {
+  const latex = escapeHtml(String(expr || "").trim());
+  return `<div class="math-block">\\[${latex}\\]</div>`;
+}
+
+function renderMathInline(expr) {
+  const latex = escapeHtml(String(expr || "").trim());
+  return `<span class="math-inline">\\(${latex}\\)</span>`;
+}
+
+function protectMath(text) {
+  let source = String(text || "");
+  const blocks = [];
+  const inlines = [];
+
+  function putBlock(expr) {
+    const index = blocks.push(String(expr || "").trim()) - 1;
+    return `\n\n@@MATH_BLOCK_${index}@@\n\n`;
+  }
+
+  function putInline(expr) {
+    const index = inlines.push(String(expr || "").trim()) - 1;
+    return `@@MATH_INLINE_${index}@@`;
+  }
+
+  // 标准块级公式：\[...\] 和 $$...$$
+  source = source.replace(/\\\[([\s\S]*?)\\\]/g, (_m, expr) => putBlock(expr));
+  source = source.replace(/\$\$([\s\S]*?)\$\$/g, (_m, expr) => putBlock(expr));
+
+  // 标准行内公式：\(...\)
+  source = source.replace(/\\\(([\s\S]*?)\\\)/g, (_m, expr) => putInline(expr));
+
+  // 兼容已经变成独立 [ ... ] 的公式块。
+  source = source.replace(/(^|\n)\s*\[\s*\n?([\s\S]*?)\n?\s*\]\s*(?=\n|$)/g, (_m, prefix, expr) => {
+    if (!isFormulaLike(expr)) return _m;
+    return `${prefix}${putBlock(expr)}`;
+  });
+
+  return { source, blocks, inlines };
+}
+
+function restoreMath(html, math) {
+  let out = String(html || "");
+
+  out = out.replace(/<p>\s*@@MATH_BLOCK_(\d+)@@\s*<\/p>/g, (_m, index) => {
+    return renderMathBlock(math.blocks[Number(index)] || "");
+  });
+
+  out = out.replace(/@@MATH_BLOCK_(\d+)@@/g, (_m, index) => {
+    return renderMathBlock(math.blocks[Number(index)] || "");
+  });
+
+  out = out.replace(/@@MATH_INLINE_(\d+)@@/g, (_m, index) => {
+    return renderMathInline(math.inlines[Number(index)] || "");
+  });
+
+  return out;
+}
+
+function mathJaxHeadHtml() {
+  const scriptSrc = getMathJaxScriptSrc();
+
+  return `
+<script>
+window.MathJax = {
+  tex: {
+    inlineMath: [['\\\\(', '\\\\)']],
+    displayMath: [['\\\\[', '\\\\]'], ['$$', '$$']],
+    processEscapes: true
+  },
+  svg: {
+    fontCache: 'local',
+    scale: 1
+  },
+  options: {
+    skipHtmlTags: ['script', 'noscript', 'style', 'textarea', 'pre', 'code']
+  },
+  startup: {
+    typeset: true
+  }
+};
+</script>
+<script id="MathJax-script" defer src="${escapeHtml(scriptSrc)}"></script>
+`;
+}
+
+async function waitForMathJax(page, logger = log) {
+  let before = { mathNodes: 0, containers: 0 };
+
+  try {
+    before = await page.evaluate(() => ({
+      mathNodes: document.querySelectorAll(".math-block, .math-inline").length,
+      containers: document.querySelectorAll("mjx-container").length
+    }));
+  } catch (_) {}
+
+  if (!before.mathNodes) return { ok: true, mathNodes: 0, containers: 0 };
+
+  try {
+    await page.waitForFunction(
+      () => !!window.MathJax,
+      { timeout: 45000 }
+    );
+  } catch (_) {}
+
+  try {
+    await page.evaluate(async () => {
+      if (window.MathJax && window.MathJax.startup && window.MathJax.startup.promise) {
+        await window.MathJax.startup.promise;
+      }
+      if (window.MathJax && window.MathJax.typesetPromise) {
+        await window.MathJax.typesetPromise();
+      }
+    });
+  } catch (_) {}
+
+  try {
+    await page.waitForFunction(
+      () => {
+        const mathNodes = document.querySelectorAll(".math-block, .math-inline").length;
+        const containers = document.querySelectorAll("mjx-container").length;
+        return mathNodes === 0 || containers > 0;
+      },
+      { timeout: 45000 }
+    );
+  } catch (_) {}
+
+  await new Promise(resolve => setTimeout(resolve, 500));
+
+  let result = { mathNodes: before.mathNodes, containers: 0, ok: false };
+  try {
+    result = await page.evaluate(() => {
+      const mathNodes = document.querySelectorAll(".math-block, .math-inline").length;
+      const containers = document.querySelectorAll("mjx-container").length;
+      return {
+        mathNodes,
+        containers,
+        ok: mathNodes === 0 || containers > 0
+      };
+    });
+  } catch (_) {}
+
+  if (result.ok) {
+    logger("MathJax SVG：渲染成功，公式数量：" + result.mathNodes);
+  } else {
+    logger("MathJax SVG：渲染失败，公式仍可能显示为 LaTeX 文本");
+  }
+
+  return result;
 }
 
 function sanitizeMessageText(text) {
@@ -279,12 +711,14 @@ function assetSrc(asset) {
 
 function renderMarkdownish(text) {
   const value = String(text || "");
+  const math = protectMath(value);
 
   if (md) {
-    return `<div class="markdown">${md.render(value)}</div>`;
+    const rendered = md.render(math.source);
+    return `<div class="markdown">${restoreMath(rendered, math)}</div>`;
   }
 
-  let html = escapeHtml(value);
+  let html = escapeHtml(math.source);
 
   // 简单处理代码块，避免全部挤成一坨。不是完整 Markdown 解析器，但够稳定。
   html = html.replace(/```([\s\S]*?)```/g, (_m, code) => {
@@ -296,7 +730,7 @@ function renderMarkdownish(text) {
     .replace(/\n{2,}/g, "</p><p>")
     .replace(/\n/g, "<br>");
 
-  return `<div class="markdown"><p>${html}</p></div>`;
+  return `<div class="markdown"><p>${restoreMath(html, math)}</p></div>`;
 }
 
 function attachmentIdentity(att, manifest) {
@@ -517,10 +951,12 @@ function buildHtml(data, messages, manifest) {
 
     return `
       <article class="message ${roleClass}">
-        <div class="role">${escapeHtml(roleName)}</div>
-        <div class="content">
-          ${textHtml}
-          ${attachmentsHtml}
+        <div class="message-card">
+          <div class="role">${escapeHtml(roleName)}</div>
+          <div class="content">
+            ${textHtml}
+            ${attachmentsHtml}
+          </div>
         </div>
       </article>`;
   }).join("\n");
@@ -530,6 +966,7 @@ function buildHtml(data, messages, manifest) {
 <head>
 <meta charset="utf-8">
 <title>${escapeHtml(title)}</title>
+${mathJaxHeadHtml()}
 <style>
   * {
     box-sizing: border-box;
@@ -565,21 +1002,66 @@ function buildHtml(data, messages, manifest) {
   }
 
   .message {
-    margin: 0 0 28px;
-    padding: 0 0 26px;
-    border-bottom: 1px solid #e5e7eb;
+    margin: 0 0 20px;
+    padding: 0;
+    border-bottom: 0;
+    page-break-inside: auto;
+    display: flex;
+    width: 100%;
+  }
+
+  .message.assistant {
+    justify-content: flex-start;
+  }
+
+  .message.user {
+    justify-content: flex-end;
+    margin-bottom: 28px;
+  }
+
+  .message-card {
     page-break-inside: auto;
   }
 
-  .role {
-    font-weight: 800;
-    font-size: 15px;
-    margin-bottom: 10px;
-    color: #374151;
+  .message.assistant .message-card {
+    width: 100%;
   }
 
-  .message.user .role {
+  .message.user .message-card {
+    width: auto;
+    max-width: 100%;
+  }
+
+  .role {
+    display: none;
+  }
+
+  .content {
+    overflow-wrap: anywhere;
+  }
+
+  .message.assistant .content {
+    border: 0;
+    background: transparent;
+    box-shadow: none;
+    padding: 0;
+    border-radius: 0;
+  }
+
+  .message.user .content {
+    display: inline-block;
+    border: 0;
+    background: #f3f4f6;
+    box-shadow: none;
+    padding: 14px 18px;
+    border-radius: 24px;
+    border-top-right-radius: 10px;
     color: #111827;
+    text-align: left;
+  }
+
+  .message.user .content p:last-child {
+    margin-bottom: 0;
   }
 
   .content p {
@@ -605,6 +1087,19 @@ function buildHtml(data, messages, manifest) {
     padding-top: 0.85em;
   }
 
+  .content h2:first-child,
+  .content h3:first-child,
+  .content p:first-child {
+    margin-top: 0;
+  }
+
+  .content p:last-child,
+  .content ul:last-child,
+  .content ol:last-child,
+  .content blockquote:last-child {
+    margin-bottom: 0;
+  }
+
   .content h3 {
     font-size: 1.2em;
   }
@@ -625,6 +1120,30 @@ function buildHtml(data, messages, manifest) {
     padding-left: 1em;
     border-left: 4px solid #d1d5db;
     color: #374151;
+  }
+
+  .content hr {
+    border: 0;
+    border-top: 1px solid #e5e7eb;
+    margin: 1.2em 0;
+  }
+
+  .message.assistant .content {
+    font-size: 18px;
+    line-height: 1.82;
+  }
+
+  .message.user .content {
+    font-size: 17px;
+    line-height: 1.6;
+  }
+
+  .message.assistant + .message.user {
+    margin-top: 10px;
+  }
+
+  .message.user + .message.assistant {
+    margin-top: 18px;
   }
 
   pre,
@@ -665,6 +1184,34 @@ function buildHtml(data, messages, manifest) {
 
   img {
     max-width: 100%;
+  }
+
+  .math-block {
+    display: block;
+    margin: 1.05em auto 1.25em;
+    padding: 0;
+    overflow-x: auto;
+    overflow-y: hidden;
+    text-align: center;
+    page-break-inside: avoid;
+  }
+
+  .math-block mjx-container[jax="SVG"] {
+    margin: 0 !important;
+    font-size: 112% !important;
+  }
+
+  .math-inline mjx-container[jax="SVG"] {
+    font-size: 104% !important;
+  }
+
+  .math-inline {
+    white-space: nowrap;
+  }
+
+  .content p + .math-block,
+  .math-block + p {
+    margin-top: 1.05em;
   }
 
   .media-list {
@@ -728,6 +1275,20 @@ function buildHtml(data, messages, manifest) {
       max-width: none;
     }
 
+    .message.assistant .message-card {
+      width: 100%;
+    }
+
+    .message.user .message-card {
+      width: auto;
+      max-width: 100%;
+    }
+
+    .message.user .content,
+    .message.assistant .content {
+      box-shadow: none;
+    }
+
     .image-chip img {
       max-height: 680px;
     }
@@ -764,7 +1325,7 @@ function findChrome() {
   return null;
 }
 
-async function htmlToPdf(htmlPath, pdfPath) {
+async function htmlToPdf(htmlPath, pdfPath, logger = log) {
   const pp = await ensurePuppeteer();
   const chrome = findChrome();
   if (!chrome) throw new Error("找不到 Google Chrome，无法生成 PDF。");
@@ -778,6 +1339,7 @@ async function htmlToPdf(htmlPath, pdfPath) {
   try {
     const page = await browser.newPage();
     await page.goto(pathToFileUrl(htmlPath), { waitUntil: "networkidle0", timeout: 120000 });
+    await waitForMathJax(page, logger);
     await page.pdf({
       path: pdfPath,
       format: "A4",
@@ -831,6 +1393,8 @@ async function convertJsonToPdf(options = {}) {
   logger("PDF 输出目录：" + pdfDir);
   logger("HTML 输出目录：" + htmlDir);
 
+  checkMathJaxRuntime(logger);
+
   fs.mkdirSync(pdfDir, { recursive: true });
   fs.mkdirSync(htmlDir, { recursive: true });
 
@@ -852,7 +1416,7 @@ async function convertJsonToPdf(options = {}) {
   fs.writeFileSync(htmlPath, html, "utf8");
 
   logger("生成 PDF：" + pdfPath);
-  await htmlToPdf(htmlPath, pdfPath);
+  await htmlToPdf(htmlPath, pdfPath, logger);
 
   logger("完成：" + pdfPath);
   return { htmlPath, pdfPath, messageCount: messages.length, pdfDir, htmlDir, outputDir };

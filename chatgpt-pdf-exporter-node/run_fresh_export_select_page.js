@@ -11,6 +11,8 @@ const ASSET_DIR = path.join(CAPTURE_DIR, "assets");
 const DEFAULT_OUTPUT_DIR = path.join(ROOT, "output");
 const OUTPUT_TEXT_FILE = path.join(ROOT, "pdf_output_dir.txt");
 const OUTPUT_JSON_FILE = path.join(ROOT, "pdf_output_config.json");
+const MATHJAX_RUNTIME_CONFIG_FILE = path.join(ROOT, "mathjax_runtime_config.json");
+const MATHJAX_CDN_SRC = "https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-svg.js";
 
 fs.mkdirSync(CAPTURE_DIR, { recursive: true });
 fs.mkdirSync(LOG_DIR, { recursive: true });
@@ -18,11 +20,213 @@ fs.mkdirSync(LOG_DIR, { recursive: true });
 const LOG_FILE = path.join(LOG_DIR, "fresh_export_select_log.txt");
 
 const REQUIRED_RUNTIME_DEPS = ["puppeteer-core"];
-const TOOL_VERSION = "v29-open-output-folder-on-exit";
+const TOOL_VERSION = "v42-main-mathjax-install-progress";
 
 function npmCommand() {
   return process.platform === "win32" ? "npm.cmd" : "npm";
 }
+
+function npmRun(args, options = {}) {
+  const stdio = options.stdio || "pipe";
+  const encoding = options.encoding || "utf8";
+  const attempts = [];
+  const nodeDir = path.dirname(process.execPath || "");
+
+  const npmCliCandidates = [
+    process.env.npm_execpath,
+    path.join(nodeDir, "node_modules", "npm", "bin", "npm-cli.js")
+  ].filter(Boolean);
+
+  for (const npmCli of npmCliCandidates) {
+    try {
+      if (fs.existsSync(npmCli) && npmCli.toLowerCase().endsWith(".js")) {
+        attempts.push({
+          cmd: process.execPath,
+          args: [npmCli, ...args],
+          shell: false,
+          label: process.execPath + " " + npmCli
+        });
+      }
+    } catch (_) {}
+  }
+
+  const npmCmdCandidates = [
+    path.join(nodeDir, process.platform === "win32" ? "npm.cmd" : "npm"),
+    process.platform === "win32" ? "npm.cmd" : "npm",
+    "npm"
+  ];
+
+  for (const npmCmd of npmCmdCandidates) {
+    attempts.push({
+      cmd: npmCmd,
+      args,
+      shell: false,
+      label: npmCmd
+    });
+  }
+
+  // Windows 上某些环境 spawnSync(npm.cmd, ..., shell:false) 会找不到，
+  // 最后再走 shell:true，让 cmd 自己解析 PATH。
+  attempts.push({
+    cmd: "npm",
+    args,
+    shell: process.platform === "win32",
+    label: "npm(shell)"
+  });
+
+  let lastResult = null;
+
+  for (const attempt of attempts) {
+    try {
+      const result = childProcess.spawnSync(attempt.cmd, attempt.args, {
+        cwd: ROOT,
+        stdio,
+        encoding,
+        shell: attempt.shell
+      });
+
+      lastResult = result;
+
+      if (!result.error && result.status === 0) {
+        return { ok: true, result, label: attempt.label };
+      }
+    } catch (err) {
+      lastResult = { error: err, status: -1, stdout: "", stderr: String(err && (err.stack || err.message) || err) };
+    }
+  }
+
+  return { ok: false, result: lastResult, label: "" };
+}
+
+function firstUsableNpmInstallCommand() {
+  const nodeDir = path.dirname(process.execPath || "");
+  const npmCliPath = path.join(nodeDir, "node_modules", "npm", "bin", "npm-cli.js");
+
+  if (fs.existsSync(npmCliPath)) {
+    return {
+      cmd: process.execPath,
+      argsPrefix: [npmCliPath],
+      shell: false,
+      label: "Node 自带 npm-cli.js"
+    };
+  }
+
+  const npmCmdPath = path.join(nodeDir, process.platform === "win32" ? "npm.cmd" : "npm");
+  if (fs.existsSync(npmCmdPath)) {
+    return {
+      cmd: npmCmdPath,
+      argsPrefix: [],
+      shell: false,
+      label: "Node 安装目录 npm.cmd"
+    };
+  }
+
+  return {
+    cmd: "npm",
+    argsPrefix: [],
+    shell: process.platform === "win32",
+    label: "shell npm"
+  };
+}
+
+function runNpmInstallMathJaxWithProgress(timeoutMs = 180000) {
+  return new Promise(resolve => {
+    const npm = firstUsableNpmInstallCommand();
+    const args = [...npm.argsPrefix, "install", "--no-audit", "--no-fund", "mathjax@3"];
+
+    log("MathJax SVG：正在执行 " + npm.label);
+    log("MathJax SVG：安装可能需要几十秒，最长等待 " + Math.round(timeoutMs / 1000) + " 秒。");
+
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+
+    let child;
+    try {
+      child = childProcess.spawn(npm.cmd, args, {
+        cwd: ROOT,
+        shell: npm.shell,
+        windowsHide: true,
+        env: {
+          ...process.env,
+          npm_config_audit: "false",
+          npm_config_fund: "false"
+        }
+      });
+    } catch (err) {
+      resolve({
+        ok: false,
+        timeout: false,
+        code: -1,
+        stdout,
+        stderr,
+        error: err
+      });
+      return;
+    }
+
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      try {
+        child.kill("SIGKILL");
+      } catch (_) {}
+      resolve({
+        ok: false,
+        timeout: true,
+        code: -1,
+        stdout,
+        stderr,
+        error: new Error("MathJax npm install timeout")
+      });
+    }, timeoutMs);
+
+    child.stdout.on("data", data => {
+      const s = data.toString("utf8");
+      stdout += s;
+      for (const line of s.split(/\r?\n/)) {
+        if (line.trim()) log("npm:", line.trim());
+      }
+    });
+
+    child.stderr.on("data", data => {
+      const s = data.toString("utf8");
+      stderr += s;
+      for (const line of s.split(/\r?\n/)) {
+        if (line.trim()) log("npm:", line.trim());
+      }
+    });
+
+    child.on("error", err => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve({
+        ok: false,
+        timeout: false,
+        code: -1,
+        stdout,
+        stderr,
+        error: err
+      });
+    });
+
+    child.on("close", code => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve({
+        ok: code === 0,
+        timeout: false,
+        code,
+        stdout,
+        stderr,
+        error: null
+      });
+    });
+  });
+}
+
 
 function hasCommand(cmd, args = ["--version"]) {
   const result = childProcess.spawnSync(cmd, args, {
@@ -103,6 +307,100 @@ function ensureDependencies() {
 
   ok("依赖安装完成");
 }
+
+function resolveLocalMathJaxScriptPath() {
+  try {
+    return require.resolve("mathjax/es5/tex-svg.js", { paths: [ROOT] });
+  } catch (_) {
+    return "";
+  }
+}
+
+function saveMathJaxRuntimeConfig(config) {
+  try {
+    fs.writeFileSync(
+      MATHJAX_RUNTIME_CONFIG_FILE,
+      JSON.stringify(
+        {
+          ...config,
+          updatedAt: new Date().toISOString()
+        },
+        null,
+        2
+      ),
+      "utf8"
+    );
+  } catch (_) {}
+}
+
+async function ensureMathJaxRuntimeAtStartup() {
+  log("检测 MathJax SVG 公式渲染...");
+
+  const existingScriptPath = resolveLocalMathJaxScriptPath();
+
+  if (existingScriptPath && fs.existsSync(existingScriptPath)) {
+    saveMathJaxRuntimeConfig({
+      source: "local",
+      scriptPath: existingScriptPath,
+      scriptSrc: pathToFileUrl(existingScriptPath)
+    });
+    ok("MathJax SVG：本地加载成功");
+    return true;
+  }
+
+  warn("MathJax SVG：本地未安装，正在安装一次...");
+  log("MathJax SVG：如果网络正常，通常需要 20-60 秒，请不要关闭窗口。");
+
+  const result = await runNpmInstallMathJaxWithProgress(180000);
+
+  if (result.ok) {
+    const installedScriptPath = resolveLocalMathJaxScriptPath();
+
+    if (installedScriptPath && fs.existsSync(installedScriptPath)) {
+      saveMathJaxRuntimeConfig({
+        source: "local",
+        scriptPath: installedScriptPath,
+        scriptSrc: pathToFileUrl(installedScriptPath)
+      });
+      ok("MathJax SVG：安装并加载成功");
+      return true;
+    }
+  }
+
+  if (result.timeout) {
+    warn("MathJax SVG：安装超过 180 秒，已停止安装，将使用 CDN 渲染公式");
+  } else {
+    warn("MathJax SVG：本地安装失败，将使用 CDN 渲染公式");
+  }
+
+  try {
+    fs.appendFileSync(
+      LOG_FILE,
+      [
+        "",
+        "[MathJax npm install failed]",
+        "status=" + String(result.code),
+        "timeout=" + String(result.timeout),
+        "error=" + String(result.error && (result.error.message || result.error) || ""),
+        "[stdout]",
+        result.stdout || "",
+        "[stderr]",
+        result.stderr || "",
+        ""
+      ].join("\n"),
+      "utf8"
+    );
+  } catch (_) {}
+
+  saveMathJaxRuntimeConfig({
+    source: "cdn",
+    scriptPath: "",
+    scriptSrc: MATHJAX_CDN_SRC
+  });
+
+  return false;
+}
+
 
 function loadPuppeteer() {
   if (!puppeteer) {
@@ -2701,6 +2999,7 @@ async function main() {
   ok("Node 版本：" + process.version);
   assertSupportedNode();
   ensureDependencies();
+  await ensureMathJaxRuntimeAtStartup();
 
   await startChromeIfNeeded();
 

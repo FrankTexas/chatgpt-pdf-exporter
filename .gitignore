@@ -80,3 +80,4 @@ pdf_output_config.json
 pdf_output_dir.txt
 *.pdf
 chatgpt_export_*.json
+chatgpt-pdf-exporter-node/mathjax_runtime_config.json
