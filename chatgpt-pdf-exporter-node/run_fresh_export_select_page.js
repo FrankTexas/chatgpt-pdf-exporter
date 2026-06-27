@@ -8,6 +8,9 @@ const ROOT = __dirname;
 const CAPTURE_DIR = path.join(ROOT, "captures");
 const LOG_DIR = path.join(ROOT, "logs");
 const ASSET_DIR = path.join(CAPTURE_DIR, "assets");
+const DEFAULT_OUTPUT_DIR = path.join(ROOT, "output");
+const OUTPUT_TEXT_FILE = path.join(ROOT, "pdf_output_dir.txt");
+const OUTPUT_JSON_FILE = path.join(ROOT, "pdf_output_config.json");
 
 fs.mkdirSync(CAPTURE_DIR, { recursive: true });
 fs.mkdirSync(LOG_DIR, { recursive: true });
@@ -15,7 +18,7 @@ fs.mkdirSync(LOG_DIR, { recursive: true });
 const LOG_FILE = path.join(LOG_DIR, "fresh_export_select_log.txt");
 
 const REQUIRED_RUNTIME_DEPS = ["puppeteer-core"];
-const TOOL_VERSION = "v28-force-exit-autoclose";
+const TOOL_VERSION = "v29-open-output-folder-on-exit";
 
 function npmCommand() {
   return process.platform === "win32" ? "npm.cmd" : "npm";
@@ -140,6 +143,104 @@ function sleep(ms) {
 
 function formatClockTime(date = new Date()) {
   return date.toLocaleTimeString("zh-CN", { hour12: false });
+}
+
+function stripBom(value) {
+  return String(value || "").replace(/^\uFEFF/, "");
+}
+
+function stripOuterQuotes(value) {
+  let v = stripBom(value).trim();
+
+  while (
+    (v.startsWith('"') && v.endsWith('"')) ||
+    (v.startsWith("'") && v.endsWith("'"))
+  ) {
+    v = v.slice(1, -1).trim();
+  }
+
+  return v;
+}
+
+function expandEnvVars(value) {
+  return String(value || "").replace(/%([^%]+)%/g, (_, name) => {
+    return process.env[name] || process.env[name.toUpperCase()] || process.env[name.toLowerCase()] || `%${name}%`;
+  });
+}
+
+function normalizeOutputPath(value) {
+  const raw = stripOuterQuotes(expandEnvVars(value));
+  if (!raw) return "";
+  return path.resolve(ROOT, raw);
+}
+
+function readSavedOutputDir() {
+  try {
+    if (fs.existsSync(OUTPUT_TEXT_FILE)) {
+      const fromText = normalizeOutputPath(fs.readFileSync(OUTPUT_TEXT_FILE, "utf8"));
+      if (fromText) return fromText;
+    }
+  } catch (_) {}
+
+  try {
+    if (fs.existsSync(OUTPUT_JSON_FILE)) {
+      const cfg = JSON.parse(fs.readFileSync(OUTPUT_JSON_FILE, "utf8"));
+      const candidates = [
+        cfg.outputDir,
+        cfg.output_dir,
+        cfg.dir,
+        cfg.path,
+        cfg.pdfOutputDir,
+        cfg.pdf_output_dir,
+        cfg?.output?.dir,
+        cfg?.output?.path
+      ];
+
+      for (const candidate of candidates) {
+        const normalized = normalizeOutputPath(candidate);
+        if (normalized) return normalized;
+      }
+    }
+  } catch (_) {}
+
+  return DEFAULT_OUTPUT_DIR;
+}
+
+function openOutputFolder() {
+  const outputDir = readSavedOutputDir();
+
+  try {
+    fs.mkdirSync(outputDir, { recursive: true });
+
+    let command = "";
+    let args = [];
+
+    if (process.platform === "win32") {
+      command = "explorer.exe";
+      args = [outputDir];
+    } else if (process.platform === "darwin") {
+      command = "open";
+      args = [outputDir];
+    } else {
+      command = "xdg-open";
+      args = [outputDir];
+    }
+
+    const child = childProcess.spawn(command, args, {
+      detached: true,
+      stdio: "ignore",
+      shell: false
+    });
+
+    child.unref();
+
+    ok("已打开输出文件夹：");
+    log(outputDir);
+  } catch (err) {
+    warn("自动打开输出文件夹失败，可手动打开：");
+    log(outputDir);
+    debugLog(String(err && (err.stack || err.message) || err));
+  }
 }
 
 function ask(question) {
@@ -2632,6 +2733,7 @@ async function main() {
 
       if (!shouldContinue) {
         log("");
+        openOutputFolder();
         ok("已退出导出流程，窗口将自动关闭。");
         break;
       }
