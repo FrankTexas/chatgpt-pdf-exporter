@@ -15,6 +15,7 @@ fs.mkdirSync(LOG_DIR, { recursive: true });
 const LOG_FILE = path.join(LOG_DIR, "fresh_export_select_log.txt");
 
 const REQUIRED_RUNTIME_DEPS = ["puppeteer-core"];
+const TOOL_VERSION = "v28-force-exit-autoclose";
 
 function npmCommand() {
   return process.platform === "win32" ? "npm.cmd" : "npm";
@@ -137,11 +138,37 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+function formatClockTime(date = new Date()) {
+  return date.toLocaleTimeString("zh-CN", { hour12: false });
+}
+
 function ask(question) {
   return new Promise(resolve => {
     process.stdout.write(question);
     process.stdin.once("data", data => resolve(data.toString().trim()));
   });
+}
+
+async function askContinueExport() {
+  while (true) {
+    log("");
+    log("下一步：");
+    log("1. 继续导出其他 ChatGPT 对话");
+    log("0. 退出程序并关闭窗口");
+    log("");
+
+    const input = (await ask("请选择 1 / 0（直接回车退出并关闭窗口）：")).trim().toLowerCase();
+
+    if (input === "" || input === "0" || input === "q" || input === "quit" || input === "exit" || input === "n" || input === "no") {
+      return false;
+    }
+
+    if (input === "1" || input === "c" || input === "continue" || input === "y" || input === "yes") {
+      return true;
+    }
+
+    warn("输入无效，请输入 1 继续，或输入 0 退出。");
+  }
 }
 
 function extractConversationId(url) {
@@ -230,12 +257,21 @@ async function connectBrowser() {
 }
 
 async function selectPage(browser) {
+  let refreshCount = 0;
+  let refreshedAt = "";
+
   while (true) {
     const pages = await browser.pages();
 
     log("");
-    log("当前 Chrome 页面：");
-    log("----------------------------------------");
+    log("========================================");
+    if (refreshCount > 0) {
+      ok("页面列表已刷新");
+      log("刷新次数：" + refreshCount + "    时间：" + refreshedAt);
+    } else {
+      log("当前 Chrome 页面");
+    }
+    log("========================================");
 
     const pageInfos = [];
 
@@ -267,14 +303,25 @@ async function selectPage(browser) {
 
     log("----------------------------------------");
     log("");
-    log("请输入你要导出的页面编号。");
-    log("说明：必须选择地址类似 https://chatgpt.com/c/xxxxx 的页面。");
-    log("输入 r 可以刷新页面列表。");
+    log("请输入页面编号导出。");
+    log("输入 r 刷新页面列表，输入 0/1/2... 选择页面。");
     log("");
 
     const input = await ask("页面编号 / r：");
+    const normalized = input.trim().toLowerCase();
 
-    if (input.toLowerCase() === "r") {
+    if (normalized === "r" || normalized === "refresh") {
+      refreshCount += 1;
+      refreshedAt = formatClockTime();
+
+      log("");
+      log("========================================");
+      log("正在刷新页面列表...");
+      log("请稍等，刷新完成后会重新显示当前 Chrome 页面。");
+      log("========================================");
+      log("");
+
+      await sleep(500);
       continue;
     }
 
@@ -628,6 +675,11 @@ function extFromMimeType(mimeType) {
   if (mime.includes("webp")) return ".webp";
   if (mime.includes("gif")) return ".gif";
   if (mime.includes("bmp")) return ".bmp";
+  if (mime.includes("avif")) return ".avif";
+  if (mime.includes("heic")) return ".heic";
+  if (mime.includes("heif")) return ".heif";
+  if (mime.includes("tiff") || mime.includes("tif")) return ".tiff";
+  if (mime.includes("ico") || mime.includes("x-icon")) return ".ico";
   if (mime.includes("svg")) return ".svg";
   return "";
 }
@@ -636,8 +688,10 @@ function extFromUrl(url) {
   try {
     const u = new URL(String(url || ""));
     const ext = path.extname(u.pathname || "").toLowerCase();
-    if ([".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".svg"].includes(ext)) {
-      return ext === ".jpeg" ? ".jpg" : ext;
+    if ([".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".svg", ".avif", ".heic", ".heif", ".tif", ".tiff", ".ico"].includes(ext)) {
+      if (ext === ".jpeg") return ".jpg";
+      if (ext === ".tif") return ".tiff";
+      return ext;
     }
   } catch (_) {}
   return "";
@@ -646,10 +700,55 @@ function extFromUrl(url) {
 function isImageLike(name, mimeType) {
   const n = String(name || "").toLowerCase();
   const m = String(mimeType || "").toLowerCase();
-  return m.startsWith("image/") || /\.(jpg|jpeg|png|webp|gif|bmp|svg)$/i.test(n);
+  return m.startsWith("image/") || /\.(jpg|jpeg|png|webp|gif|bmp|svg|avif|heic|heif|tif|tiff|ico)$/i.test(n);
 }
 
-function normalizeAttachmentRecord(raw, source, role, messageIndex) {
+function extractPossibleAttachmentUrls(raw) {
+  const urls = [];
+  const seen = new Set();
+
+  function add(value) {
+    const s = String(value || "").trim();
+    if (!s) return;
+
+    const looksUrl =
+      /^https?:\/\//i.test(s) ||
+      s.startsWith("/backend-api/") ||
+      s.startsWith("/api/") ||
+      s.startsWith("/cdn-cgi/");
+
+    if (!looksUrl) return;
+    if (seen.has(s)) return;
+
+    seen.add(s);
+    urls.push(s);
+  }
+
+  function walk(value, depth = 0) {
+    if (!value || depth > 5) return;
+
+    if (typeof value === "string") {
+      add(value);
+      return;
+    }
+
+    if (Array.isArray(value)) {
+      value.forEach(x => walk(x, depth + 1));
+      return;
+    }
+
+    if (typeof value === "object") {
+      for (const v of Object.values(value)) {
+        walk(v, depth + 1);
+      }
+    }
+  }
+
+  walk(raw);
+  return urls;
+}
+
+function normalizeAttachmentRecord(raw, source, role, messageIndex, messageText, userMessageIndex) {
   if (!raw || typeof raw !== "object") return null;
 
   const fileId = raw.file_id || raw.fileId || raw.id || raw.fileID || "";
@@ -665,6 +764,9 @@ function normalizeAttachmentRecord(raw, source, role, messageIndex) {
     source,
     role,
     messageIndex,
+    userMessageIndex,
+    messageTextSnippet: String(messageText || "").replace(/\s+/g, " ").slice(0, 240),
+    possibleUrls: extractPossibleAttachmentUrls(raw),
     isImage: isImageLike(name, mimeType)
   };
 }
@@ -681,22 +783,26 @@ function collectAttachmentRecordsFromConversation(data) {
   const branch = getCurrentBranch(data);
   const records = [];
   const seen = new Set();
+  let userMessageIndex = -1;
 
   for (let i = 0; i < branch.length; i++) {
     const msg = branch[i]?.message;
     if (!msg) continue;
 
     const role = msg.author?.role || "unknown";
+    if (role === "user") userMessageIndex++;
+
+    const messageText = contentText(msg.content);
     const attachments = Array.isArray(msg.metadata?.attachments) ? msg.metadata.attachments : [];
 
     for (const a of attachments) {
-      pushUniqueAttachment(records, seen, normalizeAttachmentRecord(a, "metadata.attachments", role, i));
+      pushUniqueAttachment(records, seen, normalizeAttachmentRecord(a, "metadata.attachments", role, i, messageText, userMessageIndex));
     }
 
     const parts = Array.isArray(msg.content?.parts) ? msg.content.parts : [];
     for (const part of parts) {
       if (part && typeof part === "object") {
-        pushUniqueAttachment(records, seen, normalizeAttachmentRecord(part, "content.parts", role, i));
+        pushUniqueAttachment(records, seen, normalizeAttachmentRecord(part, "content.parts", role, i, messageText, userMessageIndex));
       }
     }
   }
@@ -874,13 +980,7 @@ async function scrollPageToLoadImages(page, options = {}) {
     if (!result.ok) {
       warn("按消息节点滚动失败：" + result.reason);
     } else {
-      const first = result.beforeFirst && result.afterFirst
-        ? result.beforeFirst.top + " → " + result.afterFirst.top
-        : "-";
-      const last = result.beforeLast && result.afterLast
-        ? result.beforeLast.top + " → " + result.afterLast.top
-        : "-";
-      log("滚动完成：" + result.direction + "，消息 " + result.messageCount + " 条，首条位置 " + first + "，末条位置 " + last);
+      log("滚动完成：" + result.direction + "，消息 " + result.messageCount + " 条");
     }
   }
 }
@@ -1101,6 +1201,58 @@ function getImageDimensions(buffer) {
         const height = 1 + buffer.readUIntLE(27, 3);
         return { width, height, format: "webp" };
       }
+
+      if (chunk === "VP8 " && buffer.length >= 30) {
+        const width = buffer.readUInt16LE(26) & 0x3fff;
+        const height = buffer.readUInt16LE(28) & 0x3fff;
+        return { width, height, format: "webp" };
+      }
+
+      if (chunk === "VP8L" && buffer.length >= 25) {
+        const b0 = buffer[21];
+        const b1 = buffer[22];
+        const b2 = buffer[23];
+        const b3 = buffer[24];
+        const width = 1 + (((b1 & 0x3f) << 8) | b0);
+        const height = 1 + (((b3 & 0x0f) << 10) | (b2 << 2) | ((b1 & 0xc0) >> 6));
+        return { width, height, format: "webp" };
+      }
+    }
+
+    // GIF: logical screen width/height at offset 6/8.
+    if (
+      buffer.toString("ascii", 0, 3) === "GIF" &&
+      buffer.length >= 10
+    ) {
+      return {
+        width: buffer.readUInt16LE(6),
+        height: buffer.readUInt16LE(8),
+        format: "gif"
+      };
+    }
+
+    // BMP: width/height at offset 18/22.
+    if (
+      buffer[0] === 0x42 &&
+      buffer[1] === 0x4d &&
+      buffer.length >= 26
+    ) {
+      return {
+        width: Math.abs(buffer.readInt32LE(18)),
+        height: Math.abs(buffer.readInt32LE(22)),
+        format: "bmp"
+      };
+    }
+
+    // ICO: first icon width/height. 0 means 256.
+    if (
+      buffer.length >= 8 &&
+      buffer.readUInt16LE(0) === 0 &&
+      buffer.readUInt16LE(2) === 1
+    ) {
+      const w = buffer[6] || 256;
+      const h = buffer[7] || 256;
+      return { width: w, height: h, format: "ico" };
     }
   } catch (_) {}
 
@@ -1116,26 +1268,53 @@ function guessAssetNameFromUrl(url, fallback) {
   return fallback;
 }
 
-function shouldKeepCapturedImage(meta, buffer) {
+function fileIdFromUrl(url) {
+  try {
+    const u = new URL(String(url || ""));
+    const fromQuery = u.searchParams.get("id") || u.searchParams.get("file_id") || "";
+    if (/^file_[a-z0-9]+/i.test(fromQuery)) return fromQuery;
+
+    const m = String(url || "").match(/file_[a-z0-9]+/i);
+    return m ? m[0] : "";
+  } catch (_) {
+    const m = String(url || "").match(/file_[a-z0-9]+/i);
+    return m ? m[0] : "";
+  }
+}
+
+function isExactAttachmentUrl(url, imageAttachments) {
+  const fileId = fileIdFromUrl(url);
+  if (!fileId) return false;
+
+  return (imageAttachments || []).some(att => String(att?.fileId || "") === fileId);
+}
+
+function shouldKeepCapturedImage(meta, buffer, imageAttachments = []) {
   const mime = String(meta.mimeType || meta.contentType || "").toLowerCase();
   const url = String(meta.url || "");
   const ext = extFromUrl(url);
   const isImage = mime.startsWith("image/") || !!ext;
+  const exactAttachment = isExactAttachmentUrl(url, imageAttachments);
 
   if (!isImage) return false;
-  if (mime.includes("svg") || ext === ".svg") return false;
-  if (!isLikelyUsefulImageUrl(url)) return false;
+  if (!isLikelyUsefulImageUrl(url) && !exactAttachment) return false;
 
-  // 过滤网页图标、头像、小 logo。头像虽然可能有 10KB+，但尺寸通常很小。
+  // 关键修复：如果 URL 里明确带着当前附件的 file_id，就不能再按“15KB/高度”过滤。
+  // 这类截图可能很窄很矮，比如 615x50、412x85，但仍然是用户上传的图片。
+  if (exactAttachment) {
+    if (!buffer || buffer.length < 512) return false;
+    return true;
+  }
+
+  if (mime.includes("svg") || ext === ".svg") return false;
+
+  // 非精确附件图继续过滤网页图标、头像、小 logo。
   if (!buffer || buffer.length < 15 * 1024) return false;
 
   const dim = getImageDimensions(buffer);
 
   if (dim) {
-    // 头像/图标通常是 96x96、128x128、160x160 的小方图。
     if (dim.width <= 180 && dim.height <= 180) return false;
-
-    // 内容图片至少要有一边明显较大。
     if (dim.width < 220 && dim.height < 220) return false;
   }
 
@@ -1147,6 +1326,14 @@ function mapSavedImagesToAttachments(savedImages, imageAttachments) {
   const filesByName = {};
   const used = new Set();
 
+  const nameCounts = new Map();
+
+  for (const att of imageAttachments || []) {
+    const n = String(att?.name || "").trim().toLowerCase();
+    if (!n) continue;
+    nameCounts.set(n, (nameCounts.get(n) || 0) + 1);
+  }
+
   function score(img, att) {
     let s = 0;
     const url = String(img.url || "").toLowerCase();
@@ -1155,15 +1342,22 @@ function mapSavedImagesToAttachments(savedImages, imageAttachments) {
     const filename = String(img.filename || "").toLowerCase();
     const nearbyText = String(img.domImage?.nearbyText || "").toLowerCase();
     const alt = String(img.domImage?.alt || "").toLowerCase();
+    const attachmentName = String(img.attachmentName || "").toLowerCase();
+    const attachmentFileId = String(img.attachmentFileId || "").toLowerCase();
 
-    const haystack = [url, filename, nearbyText, alt].join("\n");
+    const urlFileId = String(fileIdFromUrl(img.url || "") || "").toLowerCase();
+    const haystack = [url, filename, nearbyText, alt, attachmentName, attachmentFileId].join("\n");
 
-    if (fileId && haystack.includes(fileId)) s += 1000;
-    if (name && haystack.includes(name)) s += 700;
-    if (name && filename.includes(name)) s += 500;
+    if (fileId && urlFileId === fileId) s += 3000;
+    if (fileId && attachmentFileId === fileId) s += 2500;
+    if (fileId && haystack.includes(fileId)) s += 1800;
 
-    // 只有明确命中文件名/file_id/附近文本时才匹配。
-    // 不再按“最大图片”兜底，否则会把头像、网页 UI 图误配成附件。
+    // 文件名只有唯一时才作为强匹配。image.png 这种重复名不能用来兜底，否则会错配/重复插图。
+    const nameUnique = name && (nameCounts.get(name) || 0) === 1;
+    if (nameUnique && haystack.includes(name)) s += 700;
+    if (nameUnique && filename.includes(name)) s += 500;
+    if (nameUnique && attachmentName === name) s += 1200;
+
     return s;
   }
 
@@ -1184,6 +1378,7 @@ function mapSavedImagesToAttachments(savedImages, imageAttachments) {
     if (!best || bestScore <= 0) {
       continue;
     }
+
     used.add(best.localPath);
 
     const record = {
@@ -1199,11 +1394,563 @@ function mapSavedImagesToAttachments(savedImages, imageAttachments) {
     };
 
     if (att.fileId) filesById[att.fileId] = record;
-    if (att.name) filesByName[att.name] = record;
+
+    // 只给“唯一文件名”建 name 索引，避免所有 image.png 互相覆盖。
+    const n = String(att.name || "").trim().toLowerCase();
+    if (att.name && n && (nameCounts.get(n) || 0) === 1) {
+      filesByName[att.name] = record;
+    }
   }
 
   return { filesById, filesByName };
 }
+
+function imageAttachmentKey(att) {
+  const fileId = String(att?.fileId || "").trim();
+  if (fileId) return "id:" + fileId;
+
+  const name = String(att?.name || "").trim().toLowerCase();
+  const mime = String(att?.mimeType || "").trim().toLowerCase();
+
+  if (name) return "name:" + name + "|" + mime;
+
+  return "";
+}
+
+function dedupeImageAttachments(list) {
+  const result = [];
+  const seen = new Set();
+
+  for (const item of list || []) {
+    const key = imageAttachmentKey(item);
+    if (!key) continue;
+    if (seen.has(key)) continue;
+
+    seen.add(key);
+    result.push(item);
+  }
+
+  return result;
+}
+
+function attachmentMapped(att, mapped) {
+  if (!att || !mapped) return false;
+  if (att.fileId && mapped.filesById && mapped.filesById[att.fileId]) return true;
+  if (att.name && mapped.filesByName && mapped.filesByName[att.name]) return true;
+  return false;
+}
+
+function getUnmatchedImageAttachments(savedImages, imageAttachments) {
+  const mapped = mapSavedImagesToAttachments(savedImages, imageAttachments);
+  return imageAttachments.filter(att => !attachmentMapped(att, mapped));
+}
+
+async function collectAttachmentCandidatesFromVisibleMessage(page, attachment) {
+  const terms = {
+    fileId: String(attachment?.fileId || ""),
+    name: String(attachment?.name || ""),
+    messageTextSnippet: String(attachment?.messageTextSnippet || "").replace(/\s+/g, " ").slice(0, 180),
+    userMessageIndex: Number.isFinite(attachment?.userMessageIndex) ? attachment.userMessageIndex : -1
+  };
+
+  return await page.evaluate(({ fileId, name, messageTextSnippet, userMessageIndex }) => {
+    function normalize(value) {
+      return String(value || "").replace(/\s+/g, " ").trim().toLowerCase();
+    }
+
+    function usefulSnippet(text) {
+      const t = normalize(text)
+        .replace(/\[附件：[^\]]+\]/g, "")
+        .replace(/\[文件：[^\]]+\]/g, "")
+        .replace(/\[图片：[^\]]+\]/g, "")
+        .trim();
+
+      if (t.length <= 8) return "";
+      return t.slice(0, 80);
+    }
+
+    const nameLower = normalize(name);
+    const fileIdLower = normalize(fileId);
+    const snippet = usefulSnippet(messageTextSnippet);
+
+    const nodes = Array.from(document.querySelectorAll("[data-message-author-role], article"))
+      .filter(el => !el.closest("aside, nav"));
+
+    const userNodes = nodes.filter(el => (el.getAttribute("data-message-author-role") || "") === "user");
+
+    function nodeInfo(el, index) {
+      const rect = el.getBoundingClientRect();
+      const text = String(el.innerText || "");
+      const imgs = Array.from(el.querySelectorAll("img")).map(img => ({
+        src: img.currentSrc || img.src || "",
+        alt: img.alt || "",
+        width: img.naturalWidth || Math.round(img.getBoundingClientRect().width) || 0,
+        height: img.naturalHeight || Math.round(img.getBoundingClientRect().height) || 0
+      }));
+
+      const links = Array.from(el.querySelectorAll("a[href]")).map(a => ({
+        href: a.href || "",
+        text: String(a.innerText || a.getAttribute("aria-label") || a.getAttribute("title") || "")
+      }));
+
+      return {
+        index,
+        role: el.getAttribute("data-message-author-role") || "",
+        text,
+        imgs,
+        links,
+        width: Math.round(rect.width),
+        height: Math.round(rect.height)
+      };
+    }
+
+    const matchedMessages = [];
+
+    for (let i = 0; i < nodes.length; i++) {
+      const info = nodeInfo(nodes[i], i);
+      if (info.width < 100 || info.height < 20) continue;
+
+      const haystack = normalize([
+        info.text,
+        ...info.imgs.map(x => [x.alt, x.src].join(" ")),
+        ...info.links.map(x => [x.text, x.href].join(" "))
+      ].join("\n"));
+
+      const exactMatch =
+        (fileIdLower && haystack.includes(fileIdLower)) ||
+        (nameLower && haystack.includes(nameLower));
+
+      const textMatch =
+        snippet && normalize(info.text).includes(snippet);
+
+      // 如果 DOM 是完整用户消息列表，也允许按 userMessageIndex 定位；
+      // 如果是虚拟列表，则这个条件通常不会命中，不会误用。
+      const ordinalMatch =
+        userMessageIndex >= 0 &&
+        info.role === "user" &&
+        userNodes.length > userMessageIndex &&
+        userNodes[userMessageIndex] === nodes[i];
+
+      if (exactMatch || textMatch || ordinalMatch) {
+        matchedMessages.push(info);
+      }
+    }
+
+    const candidates = [];
+
+    for (const msg of matchedMessages) {
+      for (const img of msg.imgs || []) {
+        if (!img.src) continue;
+        candidates.push({
+          src: img.src,
+          kind: "img",
+          reason: "matched-message",
+          role: msg.role,
+          nearbyText: String(msg.text || "").slice(0, 300),
+          alt: img.alt || "",
+          width: img.width || 0,
+          height: img.height || 0
+        });
+      }
+
+      for (const link of msg.links || []) {
+        if (!link.href) continue;
+        const lower = String(link.href || "").toLowerCase();
+        const looksImageOrFile =
+          /\.(jpg|jpeg|png|webp|gif|bmp|svg|avif|heic|heif|tif|tiff|ico)(\?|#|$)/i.test(lower) ||
+          lower.includes("/backend-api/") ||
+          lower.includes("/files/") ||
+          lower.includes("download") ||
+          lower.includes("file");
+
+        if (!looksImageOrFile) continue;
+
+        candidates.push({
+          src: link.href,
+          kind: "link",
+          reason: "matched-message",
+          role: msg.role,
+          nearbyText: String(msg.text || "").slice(0, 300),
+          alt: link.text || "",
+          width: 0,
+          height: 0
+        });
+      }
+    }
+
+    const seen = new Set();
+    return candidates.filter(x => {
+      if (!x.src) return false;
+      if (seen.has(x.src)) return false;
+      seen.add(x.src);
+      return true;
+    });
+  }, terms);
+}
+
+function shouldAcceptMessageContextDownload(downloaded, buffer, candidate) {
+  const contentType = String(downloaded?.contentType || "").toLowerCase();
+  const url = String(candidate?.src || "");
+  const isImage = contentType.startsWith("image/") || !!extFromUrl(url);
+  const exactAttachment =
+    candidate?.attachmentFileId &&
+    fileIdFromUrl(url) &&
+    String(candidate.attachmentFileId) === String(fileIdFromUrl(url));
+
+  if (!isImage) return false;
+
+  // 精确命中附件 file_id 的图片允许很小，因为用户上传的裁剪截图可能只有几十像素高。
+  if (exactAttachment) {
+    return !!buffer && buffer.length >= 512;
+  }
+
+  if (contentType.includes("svg") || extFromUrl(url) === ".svg") return false;
+  if (!buffer || buffer.length < 1024) return false;
+
+  const dim = getImageDimensions(buffer);
+
+  if (dim) {
+    if (dim.width <= 120 && dim.height <= 120) return false;
+    if (dim.width < 160 && dim.height < 160) return false;
+  }
+
+  return true;
+}
+
+async function pullMissingAttachmentsFromMessageContext(page, imageAttachments, savedImages) {
+  let missing = getUnmatchedImageAttachments(savedImages, imageAttachments)
+    .filter(att => att && (att.name || att.fileId));
+
+  if (missing.length === 0) return [];
+
+  log("尝试定位对应消息拉取附件：" + missing.length + " 个");
+
+  const result = [];
+  const done = new Set();
+
+  async function tryVisibleMessagesOnce() {
+    missing = getUnmatchedImageAttachments(savedImages.concat(result), imageAttachments)
+      .filter(att => att && (att.name || att.fileId));
+
+    for (const att of missing) {
+      const k = imageAttachmentKey(att) || String(att.name || att.fileId || "");
+      if (done.has(k)) continue;
+
+      let candidates = [];
+
+      try {
+        candidates = await collectAttachmentCandidatesFromVisibleMessage(page, att);
+      } catch (_) {
+        candidates = [];
+      }
+
+      for (const candidate of candidates) {
+        try {
+          candidate.attachmentFileId = att.fileId || "";
+          candidate.attachmentName = att.name || "";
+
+          const downloaded = await downloadImageFromPage(page, candidate.src);
+          const buffer = Buffer.from(downloaded.base64, "base64");
+
+          if (!shouldAcceptMessageContextDownload(downloaded, buffer, candidate)) {
+            continue;
+          }
+
+          const dimensions = getImageDimensions(buffer) || {};
+          const ext =
+            extFromMimeType(downloaded.contentType) ||
+            extFromUrl(candidate.src) ||
+            path.extname(att.name || "") ||
+            ".png";
+
+          const safeBase = safeFilename(att.name || att.fileId || ("message_attachment_" + (result.length + 1)), "message_attachment_" + (result.length + 1));
+          const parsed = path.parse(safeBase);
+          let filename = path.extname(safeBase) ? safeBase : safeBase + ext;
+          let outPath = path.join(ASSET_DIR, filename);
+
+          let suffix = 1;
+          while (fs.existsSync(outPath)) {
+            filename = (parsed.name || "message_attachment") + "_msg_" + suffix + (parsed.ext || ext);
+            outPath = path.join(ASSET_DIR, filename);
+            suffix++;
+          }
+
+          fs.writeFileSync(outPath, buffer);
+
+          result.push({
+            filename: path.basename(outPath),
+            localPath: outPath,
+            fileUrl: pathToFileUrl(outPath),
+            relativeToCaptureDir: path.relative(CAPTURE_DIR, outPath).replace(/\\/g, "/"),
+            bytes: buffer.length,
+            width: dimensions.width || candidate.width || 0,
+            height: dimensions.height || candidate.height || 0,
+            mimeType: downloaded.contentType || "",
+            url: candidate.src,
+            source: "message-context-fetch",
+            attachmentFileId: att.fileId || "",
+            attachmentName: att.name || "",
+            domImage: {
+              nearbyText: [candidate.nearbyText || "", att.name || "", att.fileId || ""].join(" "),
+              alt: candidate.alt || att.name || ""
+            }
+          });
+
+          done.add(k);
+          break;
+        } catch (_) {}
+      }
+    }
+  }
+
+  await tryVisibleMessagesOnce();
+
+  if (getUnmatchedImageAttachments(savedImages.concat(result), imageAttachments).length === 0) {
+    ok("对应消息拉取附件：" + result.length + " 个");
+    return result;
+  }
+
+  // 长对话是虚拟列表时，缺失消息未必在当前 DOM。
+  // 多轮上下 scrollIntoView，把对应消息滚出来后再从该消息内部抓 img/link。
+  for (let round = 0; round < 12; round++) {
+    const stillMissing = getUnmatchedImageAttachments(savedImages.concat(result), imageAttachments);
+
+    if (stillMissing.length === 0) break;
+
+    await scrollPageToLoadImages(page, {
+      direction: round % 2 === 0 ? "up" : "down",
+      stepDelay: 450,
+      settleDelay: 900
+    });
+
+    await sleep(800);
+    await tryVisibleMessagesOnce();
+  }
+
+  if (result.length > 0) {
+    ok("对应消息拉取附件：" + result.length + " 个");
+  }
+
+  return result;
+}
+
+
+async function downloadAttachmentFileByApi(page, attachment) {
+  const fileId = String(attachment?.fileId || "").trim();
+  if (!fileId) return null;
+
+  const name = String(attachment?.name || "").trim();
+
+  return await page.evaluate(async ({ fileId, name }) => {
+    function toAbsoluteUrl(value) {
+      if (!value || typeof value !== "string") return "";
+
+      try {
+        return new URL(value, location.origin).toString();
+      } catch (_) {
+        return "";
+      }
+    }
+
+    function findDownloadUrl(obj) {
+      const seen = new Set();
+      const stack = [obj];
+
+      while (stack.length) {
+        const cur = stack.pop();
+
+        if (!cur || typeof cur !== "object") continue;
+        if (seen.has(cur)) continue;
+        seen.add(cur);
+
+        for (const [key, value] of Object.entries(cur)) {
+          if (typeof value === "string") {
+            const lowerKey = String(key || "").toLowerCase();
+            const looksUrl =
+              value.startsWith("http://") ||
+              value.startsWith("https://") ||
+              value.startsWith("/backend-api/") ||
+              value.startsWith("/api/") ||
+              value.startsWith("/cdn-cgi/");
+
+            const goodKey =
+              lowerKey.includes("download") ||
+              lowerKey.includes("url") ||
+              lowerKey.includes("image") ||
+              lowerKey.includes("content") ||
+              lowerKey.includes("file");
+
+            if (looksUrl && goodKey) {
+              const abs = toAbsoluteUrl(value);
+              if (abs) return abs;
+            }
+          } else if (value && typeof value === "object") {
+            stack.push(value);
+          }
+        }
+      }
+
+      return "";
+    }
+
+    async function responseToPayload(response, url) {
+      const contentType = response.headers.get("content-type") || "";
+
+      if (
+        contentType.toLowerCase().startsWith("image/") ||
+        contentType.toLowerCase().includes("octet-stream")
+      ) {
+        const buffer = await response.arrayBuffer();
+
+        if (!buffer || buffer.byteLength <= 0) return null;
+
+        const bytes = new Uint8Array(buffer);
+        const chunkSize = 0x8000;
+        let binary = "";
+
+        for (let i = 0; i < bytes.length; i += chunkSize) {
+          binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
+        }
+
+        return {
+          contentType,
+          byteLength: bytes.length,
+          base64: btoa(binary),
+          url
+        };
+      }
+
+      if (contentType.toLowerCase().includes("json")) {
+        let json = null;
+
+        try {
+          json = await response.json();
+        } catch (_) {}
+
+        const nestedUrl = findDownloadUrl(json);
+
+        if (nestedUrl) {
+          const nested = await fetch(nestedUrl, { credentials: "include" });
+          if (nested.ok) {
+            return await responseToPayload(nested, nestedUrl);
+          }
+        }
+      }
+
+      return null;
+    }
+
+    const encodedId = encodeURIComponent(fileId);
+    const encodedName = encodeURIComponent(name || "");
+
+    const endpoints = [
+      `/backend-api/estuary/content?id=${encodedId}`,
+      `/backend-api/files/${encodedId}/download`,
+      `/backend-api/files/${encodedId}/download?filename=${encodedName}`,
+      `/backend-api/files/${encodedId}/download?download=true`,
+      `/backend-api/files/${encodedId}/content`,
+      `/backend-api/files/${encodedId}`,
+      `/backend-api/files/${encodedId}/metadata`
+    ];
+
+    for (const endpoint of endpoints) {
+      const url = toAbsoluteUrl(endpoint);
+
+      if (!url) continue;
+
+      try {
+        const response = await fetch(url, { credentials: "include" });
+
+        if (!response.ok) continue;
+
+        const payload = await responseToPayload(response, url);
+        if (payload && payload.base64 && payload.byteLength > 0) {
+          return payload;
+        }
+      } catch (_) {}
+    }
+
+    return null;
+  }, { fileId, name });
+}
+
+async function downloadMissingAttachmentsByApi(page, imageAttachments, savedImages) {
+  const missing = getUnmatchedImageAttachments(savedImages, imageAttachments)
+    .filter(x => x.fileId);
+
+  if (missing.length === 0) return [];
+
+  log("尝试通过 file_id 补抓缺失图片：" + missing.length + " 个");
+
+  const result = [];
+
+  for (let i = 0; i < missing.length; i++) {
+    const att = missing[i];
+
+    try {
+      const downloaded = await downloadAttachmentFileByApi(page, att);
+
+      if (!downloaded || !downloaded.base64) {
+        debugLog("file_id 补抓失败：" + (att.name || att.fileId));
+        continue;
+      }
+
+      const buffer = Buffer.from(downloaded.base64, "base64");
+      if (!buffer || buffer.length <= 0) continue;
+
+      const dim = getImageDimensions(buffer) || {};
+      const ext =
+        extFromMimeType(downloaded.contentType) ||
+        extFromUrl(downloaded.url) ||
+        path.extname(att.name || "") ||
+        ".jpg";
+
+      const baseName = safeFilename(att.name || att.fileId || ("api_image_" + (i + 1)), "api_image_" + (i + 1));
+      const filename = path.extname(baseName) ? baseName : baseName + ext;
+      let outPath = path.join(ASSET_DIR, filename);
+
+      if (fs.existsSync(outPath)) {
+        const parsed = path.parse(filename);
+        outPath = path.join(ASSET_DIR, parsed.name + "_api_" + (i + 1) + parsed.ext);
+      }
+
+      fs.writeFileSync(outPath, buffer);
+
+      result.push({
+        filename: path.basename(outPath),
+        localPath: outPath,
+        fileUrl: pathToFileUrl(outPath),
+        relativeToCaptureDir: path.relative(CAPTURE_DIR, outPath).replace(/\\/g, "/"),
+        bytes: buffer.length,
+        width: dim.width || 0,
+        height: dim.height || 0,
+        mimeType: downloaded.contentType || att.mimeType || "",
+        url: downloaded.url || "",
+        source: "backend-file-api",
+        attachmentFileId: att.fileId,
+        attachmentName: att.name
+      });
+
+      debugLog("file_id 补抓成功：" + path.basename(outPath));
+    } catch (e) {
+      debugLog("file_id 补抓异常：" + (att.name || att.fileId) + " - " + e.message);
+    }
+
+    // 每抓一张就看是否已经补齐。
+    const combined = savedImages.concat(result);
+    if (getVerifiedMappedCount(combined, imageAttachments) >= imageAttachments.length) {
+      break;
+    }
+  }
+
+  if (result.length > 0) {
+    ok("file_id 补抓图片：" + result.length + " 个");
+  }
+
+  return result;
+}
+
+
 
 async function captureNetworkImages(page, imageAttachments) {
   log("开始 Network 捕获图片资源...");
@@ -1253,7 +2000,7 @@ async function captureNetworkImages(page, imageAttachments) {
         buffer = Buffer.from(result.body || "", "utf8");
       }
 
-      if (!shouldKeepCapturedImage(meta, buffer)) return;
+      if (!shouldKeepCapturedImage(meta, buffer, imageAttachments)) return;
 
       const dimensions = getImageDimensions(buffer) || {};
 
@@ -1302,7 +2049,7 @@ async function captureNetworkImages(page, imageAttachments) {
     await sleep(1200);
 
     const targetCount = Math.max(1, imageAttachments.length);
-    const maxRounds = Math.min(5, Math.max(3, targetCount + 1));
+    const maxRounds = Math.min(12, Math.max(5, Math.ceil(targetCount / 4) + 4));
 
     for (let round = 0; round < maxRounds; round++) {
       const verifiedBefore = getVerifiedMappedCount(savedImages, imageAttachments);
@@ -1344,45 +2091,43 @@ async function captureNetworkImages(page, imageAttachments) {
 
 function cleanUserDisplayName(value) {
   let s = String(value || "")
+    .replace(/\uFEFF/g, "")
     .replace(/\s+/g, " ")
     .trim();
 
   if (!s) return "";
 
-  s = s
-    .replace(/^["“”'‘’]+|["“”'‘’]+$/g, "")
-    .replace(/^logged in as\s*/i, "")
-    .replace(/^signed in as\s*/i, "")
-    .replace(/^当前登录为\s*/i, "")
-    .trim();
-
-  // ChatGPT 账号按钮可能把用户名和套餐/升级按钮拼在一起：
-  // 例如：Texas Frank免费版升级、Texas Frank Free plan Upgrade
-  const planPatterns = [
-    /免费版升级.*$/i,
-    /升级.*$/i,
-    /free\s*plan\s*upgrade.*$/i,
-    /free\s*upgrade.*$/i,
-    /upgrade\s*plan.*$/i,
-    /plus\s*upgrade.*$/i,
-    /go\s*upgrade.*$/i,
-    /pro\s*upgrade.*$/i,
-    /team\s*upgrade.*$/i,
-    /enterprise\s*upgrade.*$/i,
-    /免费版.*$/i,
-    /free\s*plan.*$/i,
-    /plus\s*plan.*$/i,
-    /go\s*plan.*$/i,
-    /pro\s*plan.*$/i,
-    /team\s*plan.*$/i,
-    /enterprise\s*plan.*$/i
+  const cutTokens = [
+    "免费版升级",
+    "免费版",
+    "升级",
+    "Free plan Upgrade",
+    "Free Plan Upgrade",
+    "free plan upgrade",
+    "Free plan",
+    "Free Plan",
+    "free plan",
+    "Upgrade plan",
+    "upgrade plan",
+    "Upgrade",
+    "upgrade",
+    "Plus plan",
+    "plus plan",
+    "Go plan",
+    "go plan",
+    "Pro plan",
+    "pro plan",
+    "Team plan",
+    "team plan",
+    "Enterprise plan",
+    "enterprise plan"
   ];
 
-  for (const r of planPatterns) {
-    s = s.replace(r, "").trim();
+  for (const token of cutTokens) {
+    const idx = s.toLowerCase().indexOf(token.toLowerCase());
+    if (idx >= 0) s = s.slice(0, idx).trim();
   }
 
-  // 常见分隔符后面如果是升级/套餐文案，也裁掉。
   s = s
     .replace(/[|｜·•\-–—]\s*(免费版|升级|free|upgrade|plus|go|pro|team|enterprise).*$/i, "")
     .trim();
@@ -1429,8 +2174,16 @@ function readConfiguredUserDisplayName() {
   for (const p of candidates) {
     try {
       if (!fs.existsSync(p)) continue;
-      const name = cleanUserDisplayName(fs.readFileSync(p, "utf8").replace(/^\uFEFF/, ""));
-      if (name) return name;
+
+      const raw = fs.readFileSync(p, "utf8").replace(/^\uFEFF/, "");
+      const name = cleanUserDisplayName(raw);
+
+      if (name) {
+        if (String(raw || "").trim() !== name && path.basename(p).toLowerCase() === "pdf_user_name.txt") {
+          fs.writeFileSync(p, name + "\n", "utf8");
+        }
+        return name;
+      }
     } catch (_) {}
   }
 
@@ -1445,158 +2198,157 @@ async function captureUserDisplayName(page) {
     return configured;
   }
 
-  try {
-    const name = await page.evaluate(() => {
-      function clean(value) {
-        let s = String(value || "")
-          .replace(/\s+/g, " ")
-          .trim();
+  log("PDF 用户名：默认“用户”");
+  return "";
+}
 
-        if (!s) return "";
+async function captureMissingAttachmentsAsMessageScreenshots(page, imageAttachments, savedImages) {
+  const missing = getUnmatchedImageAttachments(savedImages, imageAttachments)
+    .filter(att => att && (att.name || att.fileId));
 
-        const planPatterns = [
-          /免费版升级.*$/i,
-          /升级.*$/i,
-          /free\s*plan\s*upgrade.*$/i,
-          /free\s*upgrade.*$/i,
-          /upgrade\s*plan.*$/i,
-          /plus\s*upgrade.*$/i,
-          /go\s*upgrade.*$/i,
-          /pro\s*upgrade.*$/i,
-          /team\s*upgrade.*$/i,
-          /enterprise\s*upgrade.*$/i,
-          /免费版.*$/i,
-          /free\s*plan.*$/i,
-          /plus\s*plan.*$/i,
-          /go\s*plan.*$/i,
-          /pro\s*plan.*$/i,
-          /team\s*plan.*$/i,
-          /enterprise\s*plan.*$/i
-        ];
+  if (missing.length === 0) return [];
 
-        for (const r of planPatterns) {
-          s = s.replace(r, "").trim();
-        }
+  log("尝试截图兜底缺失图片：" + missing.length + " 个");
 
-        s = s
-          .replace(/[|｜·•\-–—]\s*(免费版|升级|free|upgrade|plus|go|pro|team|enterprise).*$/i, "")
-          .trim();
+  const result = [];
+  const doneKeys = new Set();
 
-        const lower = s.toLowerCase();
-        const badContains = [
-          "打开",
-          "菜单",
-          "个人资料",
-          "账户",
-          "账号",
-          "profile",
-          "account",
-          "menu",
-          "settings",
-          "setting",
-          "logout",
-          "log out",
-          "sign out",
-          "upgrade",
-          "new chat",
-          "chatgpt",
-          "openai"
-        ];
+  function keyFor(att) {
+    return imageAttachmentKey(att) || String(att.name || att.fileId || "");
+  }
 
-        if (badContains.some(k => lower.includes(k))) return "";
-        if (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(s)) return "";
-        if (s.length < 2 || s.length > 40) return "";
+  async function findAndScreenshotVisibleMessages() {
+    const handles = await page.$$("[data-message-author-role], article");
 
-        return s;
-      }
+    for (const handle of handles) {
+      let info = null;
 
-      const candidates = [];
-
-      function add(value, source, score) {
-        const s = clean(value);
-        if (s) candidates.push({ value: s, source, score });
-      }
-
-      // 先从 storage 取真正的 name/displayName。不要从 aria-label 取，aria-label 常是“打开个人资料菜单”。
       try {
-        const stores = [window.localStorage, window.sessionStorage].filter(Boolean);
+        info = await handle.evaluate(el => {
+          const text = String(el.innerText || "");
+          const role = el.getAttribute("data-message-author-role") || "";
+          const imgs = Array.from(el.querySelectorAll("img")).map(img => ({
+            alt: img.alt || "",
+            src: img.currentSrc || img.src || "",
+            width: img.naturalWidth || img.width || 0,
+            height: img.naturalHeight || img.height || 0
+          }));
 
-        for (const store of stores) {
-          for (let i = 0; i < store.length; i++) {
-            const key = store.key(i) || "";
-            if (!/(user|profile|account|session|auth)/i.test(key)) continue;
+          const rect = el.getBoundingClientRect();
 
-            const raw = store.getItem(key) || "";
-            if (!raw || raw.length > 30000) continue;
-
-            try {
-              const obj = JSON.parse(raw);
-              const stack = [obj];
-
-              while (stack.length) {
-                const cur = stack.pop();
-                if (!cur || typeof cur !== "object") continue;
-
-                for (const [k, v] of Object.entries(cur)) {
-                  if (v && typeof v === "object") {
-                    stack.push(v);
-                    continue;
-                  }
-
-                  if (/^(name|displayName|display_name|fullName|full_name)$/i.test(k)) {
-                    add(v, "storage", 100);
-                  }
-                }
-              }
-            } catch (_) {}
-          }
-        }
-      } catch (_) {}
-
-      // 其次只取 img alt / 可见文本，不取 aria-label。
-      const selectors = [
-        '[data-testid="profile-button"]',
-        '[data-testid*="profile" i]',
-        'button'
-      ];
-
-      for (const selector of selectors) {
-        for (const el of Array.from(document.querySelectorAll(selector)).slice(0, 80)) {
-          const img = el.querySelector && el.querySelector("img[alt]");
-          if (img) add(img.getAttribute("alt"), "img-alt", 50);
-
-          // 只取非常短的可见文本；按钮说明会被 clean 拦掉。
-          const text = String(el.textContent || "").trim();
-          if (text && text.length <= 40) add(text, "button-text", 30);
-        }
+          return {
+            role,
+            text,
+            imgs,
+            width: Math.round(rect.width),
+            height: Math.round(rect.height)
+          };
+        });
+      } catch (_) {
+        continue;
       }
 
-      candidates.sort((a, b) => b.score - a.score);
+      if (!info) continue;
+      if (info.width < 100 || info.height < 30) continue;
 
-      const seen = new Set();
-      for (const c of candidates) {
-        if (seen.has(c.value)) continue;
-        seen.add(c.value);
-        return c.value;
+      const haystack = [
+        info.text,
+        ...(info.imgs || []).map(x => [x.alt, x.src].join(" "))
+      ].join("\n").toLowerCase();
+
+      for (const att of missing) {
+        const k = keyFor(att);
+
+        if (doneKeys.has(k)) continue;
+
+        const name = String(att.name || "").toLowerCase();
+        const fileId = String(att.fileId || "").toLowerCase();
+
+        const matched =
+          (name && haystack.includes(name)) ||
+          (fileId && haystack.includes(fileId));
+
+        if (!matched) continue;
+
+        const safeBase = safeFilename(att.name || att.fileId || ("message_screenshot_" + (result.length + 1)), "message_screenshot_" + (result.length + 1));
+        const parsed = path.parse(safeBase);
+        let filename = (parsed.name || safeBase) + "_message.png";
+        let outPath = path.join(ASSET_DIR, filename);
+
+        let suffix = 1;
+        while (fs.existsSync(outPath)) {
+          filename = (parsed.name || safeBase) + "_message_" + suffix + ".png";
+          outPath = path.join(ASSET_DIR, filename);
+          suffix++;
+        }
+
+        try {
+          await handle.screenshot({ path: outPath });
+          const stat = fs.statSync(outPath);
+
+          result.push({
+            filename: path.basename(outPath),
+            localPath: outPath,
+            fileUrl: pathToFileUrl(outPath),
+            relativeToCaptureDir: path.relative(CAPTURE_DIR, outPath).replace(/\\/g, "/"),
+            bytes: stat.size,
+            width: info.width || 0,
+            height: info.height || 0,
+            mimeType: "image/png",
+            url: "",
+            source: "message-screenshot-fallback",
+            attachmentFileId: att.fileId || "",
+            attachmentName: att.name || "",
+            domImage: {
+              nearbyText: [att.name || "", att.fileId || ""].join(" "),
+              alt: att.name || ""
+            }
+          });
+
+          doneKeys.add(k);
+          debugLog("消息截图兜底成功：" + path.basename(outPath));
+        } catch (e) {
+          debugLog("消息截图兜底失败：" + (att.name || att.fileId) + " - " + e.message);
+        }
       }
+    }
+  }
 
-      return "";
+  await findAndScreenshotVisibleMessages();
+
+  if (result.length >= missing.length) {
+    ok("消息截图兜底：" + result.length + " 个");
+    return result;
+  }
+
+  // 长对话可能是虚拟列表，只保留当前视口附近消息。多滚几轮，把缺失附件所在消息滚出来再截图。
+  for (let round = 0; round < 10; round++) {
+    const combined = savedImages.concat(result);
+    const stillMissing = getUnmatchedImageAttachments(combined, imageAttachments);
+
+    if (stillMissing.length === 0) break;
+
+    await scrollPageToLoadImages(page, {
+      direction: round % 2 === 0 ? "up" : "down",
+      stepDelay: 420,
+      settleDelay: 900
     });
 
-    const cleaned = cleanUserDisplayName(name);
+    await sleep(600);
+    await findAndScreenshotVisibleMessages();
 
-    if (cleaned) {
-      ok("PDF 用户名：" + cleaned);
-      return cleaned;
+    if (getUnmatchedImageAttachments(savedImages.concat(result), imageAttachments).length === 0) {
+      break;
     }
-
-    log("PDF 用户名：默认“用户”");
-    return "";
-  } catch (_) {
-    log("PDF 用户名：默认“用户”");
-    return "";
   }
+
+  if (result.length > 0) {
+    ok("消息截图兜底：" + result.length + " 个");
+  }
+
+  return result;
 }
+
 
 async function collectAndSaveImageAssets(page, jsonPath) {
   log("");
@@ -1609,15 +2361,17 @@ async function collectAndSaveImageAssets(page, jsonPath) {
   const data = JSON.parse(extractJsonText(raw));
   const attachments = collectAttachmentRecordsFromConversation(data);
   const imageAttachments = attachments.filter(x => x.isImage);
+  const uniqueImageAttachments = dedupeImageAttachments(imageAttachments);
 
   const manifest = {
-    version: 18,
+    version: 24,
     generatedAt: new Date().toISOString(),
-    note: "v18：用户名清理会去掉免费版/升级/Free plan 等套餐按钮文案。",
+    note: "v24：精确 file_id 命中时允许小图；禁止 image.png 这类重复文件名兜底误配；增加 estuary file_id 直连补抓。",
     captureDir: CAPTURE_DIR,
     assetDir: ASSET_DIR,
     attachments,
     imageAttachments,
+    uniqueImageAttachments,
     filesById: {},
     filesByName: {},
     allSavedImages: [],
@@ -1629,16 +2383,16 @@ async function collectAndSaveImageAssets(page, jsonPath) {
   manifest.userDisplayName = await captureUserDisplayName(page);
 
   log("附件元数据数量：" + attachments.length);
-  log("图片附件元数据数量：" + imageAttachments.length);
+  log("图片附件元数据数量：" + imageAttachments.length + "，去重后：" + uniqueImageAttachments.length);
 
-  if (imageAttachments.length === 0) {
+  if (uniqueImageAttachments.length === 0) {
     warn("conversation JSON 中没有发现图片附件元数据，跳过图片抓取。");
     fs.writeFileSync(path.join(CAPTURE_DIR, "assets_manifest.json"), JSON.stringify(manifest, null, 2), "utf8");
     return manifest;
   }
 
   // 第一优先级：Network 响应抓图。这个比 DOM img 更适合抓用户上传附件。
-  const networkImages = await captureNetworkImages(page, imageAttachments).catch(e => {
+  const networkImages = await captureNetworkImages(page, uniqueImageAttachments).catch(e => {
     warn("Network 图片捕获失败：" + e.message);
     manifest.errors.push({ stage: "network", error: e.message });
     return [];
@@ -1648,10 +2402,10 @@ async function collectAndSaveImageAssets(page, jsonPath) {
 
   // 第二优先级：DOM img 下载，作为兜底。
   // 已核对通过时不再继续滚动；未核对通过时，只滚聊天正文区域补一次。
-  const networkVerifiedCount = getVerifiedMappedCount(manifest.allSavedImages, imageAttachments);
-  log("图片候选：" + manifest.allSavedImages.length + " 个，已匹配：" + networkVerifiedCount + "/" + imageAttachments.length);
+  const networkVerifiedCount = getVerifiedMappedCount(manifest.allSavedImages, uniqueImageAttachments);
+  log("图片候选：" + manifest.allSavedImages.length + " 个，已匹配：" + networkVerifiedCount + "/" + uniqueImageAttachments.length);
 
-  if (networkVerifiedCount < imageAttachments.length) {
+  if (networkVerifiedCount < uniqueImageAttachments.length) {
     await scrollPageToLoadImages(page, { passes: 1, direction: "both", stepDelay: 600, settleDelay: 1700 });
   } else {
     ok("图片附件已全部核对通过，跳过 DOM 兜底滚动");
@@ -1668,8 +2422,8 @@ async function collectAndSaveImageAssets(page, jsonPath) {
   debugLog("页面可疑 img 数量：" + candidates.length);
   debugLog("页面图片诊断已保存：" + path.join(CAPTURE_DIR, "page_images_debug.json"));
 
-  if (getVerifiedMappedCount(manifest.allSavedImages, imageAttachments) < imageAttachments.length && candidates.length > 0) {
-    const chosen = chooseImageCandidatesForAttachments(candidates, imageAttachments);
+  if (getVerifiedMappedCount(manifest.allSavedImages, uniqueImageAttachments) < uniqueImageAttachments.length && candidates.length > 0) {
+    const chosen = chooseImageCandidatesForAttachments(candidates, uniqueImageAttachments);
 
     if (chosen.length === 0) {
       warn("DOM 中没有找到能明确匹配附件文件名/file_id 的图片，跳过 DOM 下载，避免错图。");
@@ -1705,9 +2459,9 @@ async function collectAndSaveImageAssets(page, jsonPath) {
 
         debugLog("DOM 候选图片已保存：" + filename + " (" + downloaded.byteLength + " bytes)");
 
-        const verifiedNow = getVerifiedMappedCount(manifest.allSavedImages, imageAttachments);
-        if (verifiedNow >= imageAttachments.length) {
-          ok("DOM 图片附件已核对通过：" + verifiedNow + "/" + imageAttachments.length + "，停止 DOM 下载");
+        const verifiedNow = getVerifiedMappedCount(manifest.allSavedImages, uniqueImageAttachments);
+        if (verifiedNow >= uniqueImageAttachments.length) {
+          ok("DOM 图片附件已核对通过：" + verifiedNow + "/" + uniqueImageAttachments.length + "，停止 DOM 下载");
           break;
         }
       } catch (e) {
@@ -1716,7 +2470,49 @@ async function collectAndSaveImageAssets(page, jsonPath) {
     }
   }
 
-  const mapped = mapSavedImagesToAttachments(manifest.allSavedImages, imageAttachments);
+  // 第三优先级：如果前面读取失败，先定位到对应消息，在那条消息内拉取 img/link 附件。
+  // 这个比全局抓图更安全：只在匹配到文件名/file_id/消息文本的消息里取图。
+  const verifiedBeforeMessagePull = getVerifiedMappedCount(manifest.allSavedImages, uniqueImageAttachments);
+
+  if (verifiedBeforeMessagePull < uniqueImageAttachments.length) {
+    const messageImages = await pullMissingAttachmentsFromMessageContext(page, uniqueImageAttachments, manifest.allSavedImages).catch(e => {
+      warn("对应消息拉取附件失败：" + e.message);
+      manifest.errors.push({ stage: "message-context-fetch", error: e.message });
+      return [];
+    });
+
+    manifest.allSavedImages.push(...messageImages);
+  }
+
+  // 第四优先级：用 file_id 后端接口补抓缺失图片。
+  // 这个不依赖滚动页面，适合长对话里 Network 没触发到的图片。
+  const verifiedBeforeApi = getVerifiedMappedCount(manifest.allSavedImages, uniqueImageAttachments);
+
+  if (verifiedBeforeApi < uniqueImageAttachments.length) {
+    const apiImages = await downloadMissingAttachmentsByApi(page, uniqueImageAttachments, manifest.allSavedImages).catch(e => {
+      warn("file_id 补抓失败：" + e.message);
+      manifest.errors.push({ stage: "file-api", error: e.message });
+      return [];
+    });
+
+    manifest.allSavedImages.push(...apiImages);
+  }
+
+  // 第五优先级：仍然缺失时，截图包含附件的消息区域作为兜底。
+  // 这不是原图，但能保证 PDF 里有可见内容，适合 ChatGPT 虚拟列表/鉴权图片拿不到原图的情况。
+  const verifiedBeforeScreenshot = getVerifiedMappedCount(manifest.allSavedImages, uniqueImageAttachments);
+
+  if (verifiedBeforeScreenshot < uniqueImageAttachments.length) {
+    const screenshotImages = await captureMissingAttachmentsAsMessageScreenshots(page, uniqueImageAttachments, manifest.allSavedImages).catch(e => {
+      warn("消息截图兜底失败：" + e.message);
+      manifest.errors.push({ stage: "message-screenshot", error: e.message });
+      return [];
+    });
+
+    manifest.allSavedImages.push(...screenshotImages);
+  }
+
+  const mapped = mapSavedImagesToAttachments(manifest.allSavedImages, uniqueImageAttachments);
   manifest.filesById = mapped.filesById;
   manifest.filesByName = mapped.filesByName;
 
@@ -1729,8 +2525,8 @@ async function collectAndSaveImageAssets(page, jsonPath) {
     return !rec.fileId;
   }).length;
 
-  const verifiedFinalCount = getVerifiedMappedCount(manifest.allSavedImages, imageAttachments);
-  ok("图片附件完成：匹配 " + verifiedFinalCount + "/" + imageAttachments.length);
+  const verifiedFinalCount = getVerifiedMappedCount(manifest.allSavedImages, uniqueImageAttachments);
+  ok("图片附件完成：匹配 " + verifiedFinalCount + "/" + uniqueImageAttachments.length);
   debugLog("图片 manifest：" + manifestPath);
 
   if (savedCount === 0) {
@@ -1784,7 +2580,7 @@ function runJsonToPdf() {
         return;
       }
 
-      ok("PDF 生成脚本运行完成");
+      ok("PDF 导出完成");
       resolve();
     });
   });
@@ -1795,6 +2591,7 @@ async function main() {
 
   log("========================================");
   log("ChatGPT 半自动选择窗口导出");
+  log("版本：" + TOOL_VERSION);
   log("========================================");
   log("项目目录：" + ROOT);
   log("日志文件：" + LOG_FILE);
@@ -1809,36 +2606,54 @@ async function main() {
   const browser = await connectBrowser();
 
   try {
-    const selected = await selectPage(browser);
+    while (true) {
+      const selected = await selectPage(browser);
 
-    const jsonPath = await captureConversationJson(selected.page, selected.conversationId);
+      const jsonPath = await captureConversationJson(selected.page, selected.conversationId);
 
-    const result = checkConversationJson(jsonPath);
+      const result = checkConversationJson(jsonPath);
 
-    log("");
-    log("JSON 抓取与检查完成。");
-    log("可导出消息数：" + result.visible);
-    log("疑似图片/附件数量：" + result.media);
+      log("");
+      log("JSON 抓取与检查完成。");
+      log("可导出消息数：" + result.visible);
+      log("疑似图片/附件数量：" + result.media);
 
-    await collectAndSaveImageAssets(selected.page, jsonPath);
+      await collectAndSaveImageAssets(selected.page, jsonPath);
 
-    await runJsonToPdf();
+      await runJsonToPdf();
 
-    log("");
-    log("========================================");
-    log("SUCCESS");
-    log("已完成：选择窗口 → 抓取最新 JSON → 检查 → 生成 PDF");
-    log("========================================");
+      log("");
+      log("========================================");
+      log("SUCCESS");
+      log("已完成：选择窗口 → 抓取最新 JSON → 检查 → 生成 PDF");
+      log("========================================");
+
+      const shouldContinue = await askContinueExport();
+
+      if (!shouldContinue) {
+        log("");
+        ok("已退出导出流程，窗口将自动关闭。");
+        break;
+      }
+
+      log("");
+      log("准备继续导出，下次选择页面会重新列出当前 Chrome 页面。");
+    }
   } finally {
     await browser.disconnect().catch(() => {});
   }
 }
 
-main().catch(err => {
-  log("");
-  log("========================================");
-  log("FAILED");
-  log(String(err.stack || err.message || err));
-  log("========================================");
-  process.exit(1);
-});
+main()
+  .then(() => {
+    // 显式退出，避免 puppeteer/chrome 连接、stdin 等句柄残留导致 bat 窗口不关闭。
+    process.exit(0);
+  })
+  .catch(err => {
+    log("");
+    log("========================================");
+    log("FAILED");
+    log(String(err.stack || err.message || err));
+    log("========================================");
+    process.exit(1);
+  });

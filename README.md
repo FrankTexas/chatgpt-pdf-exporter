@@ -1,55 +1,11 @@
-# ChatGPT PDF Exporter 使用说明
+# ChatGPT PDF Exporter
 
-## 一、项目简介
+一个用于将 ChatGPT 对话导出为 **PDF + HTML 网页备份** 的本地小工具。
 
-ChatGPT PDF Exporter 是一个用于将 ChatGPT 聊天记录导出为 PDF 的 Windows 小工具。
+当前推荐使用 **Node.js 版本**。旧版 Python 方案可以作为备用保留。
 
-本项目目前保留两套方案：
 
-```text
-方案 A：Node.js 版本，当前推荐，适合普通用户一键导出
-方案 B：Python / Playwright 版本，第一版方案，保留给开发者和备用使用
-```
-
-普通用户建议使用 Node.js 版本；如果你之前已经在用 Python 版本，也可以继续保留。
-
----
-
-## 二、推荐给普通用户的使用方式：Node.js 版本
-
-### 1. 普通用户应该点哪个？
-
-普通用户只需要双击：
-
-```text
-双击开始导出PDF.bat
-```
-
-这个启动器会自动完成：
-
-```text
-检查 Node.js
-检查 npm
-检查依赖
-首次运行自动安装依赖
-启动或连接 Chrome
-列出当前 Chrome 页面
-让用户选择 ChatGPT 对话
-抓取 conversation JSON
-生成 PDF
-```
-
-### 2. 修改 PDF 保存位置
-
-如果想修改 PDF 输出目录，双击：
-
-```text
-修改PDF保存位置.bat
-```
-
-程序会记住新的输出路径。
-
-### 3. Node.js 版本需要的环境
+###  Node.js 版本需要的环境
 
 ```text
 Windows 10 / Windows 11
@@ -62,7 +18,220 @@ npm
 
 ---
 
-## 三、保留的第一版方案：Python / Playwright 版本
+## 一、使用
+
+进入：
+
+```txt
+chatgpt-pdf-exporter-node
+```
+
+双击：
+
+```txt
+01_双击开始导出PDF.bat
+```
+
+正常流程：
+
+```txt
+1. 工具会检查 Node.js / npm / 依赖
+2. 自动连接或启动调试版 Chrome
+3. 在 Chrome 里打开你要导出的 ChatGPT 对话
+4. 回到窗口，输入对应页面编号
+5. 工具自动抓取对话内容和图片附件
+6. 自动生成 PDF 和 HTML
+7. 结束后可以选择继续导出，或退出程序
+```
+
+---
+
+## 二、输出文件保存位置
+
+第一次导出时，如果没有保存过输出目录，会让你选择 PDF 保存位置。
+
+后续会自动使用上次选择的位置。
+
+想重新修改保存位置，双击：
+
+```txt
+02_修改PDF保存位置.bat
+```
+
+导出完成后，文件会分开放置：
+
+```txt
+你选择的输出目录/
+├─ PDF/
+│  └─ 对话标题_时间.pdf
+└─ HTML/
+   └─ 对话标题_时间.html
+```
+
+例如：
+
+```txt
+C:\Users\...\Desktop\聊天记录\PDF\主代码分析_20260627_054244.pdf
+C:\Users\...\Desktop\聊天记录\HTML\主代码分析_20260627_054244.html
+```
+
+## 三、导出完成后继续或退出
+
+导出完成后会出现：
+
+```txt
+下一步：
+1. 继续导出其他 ChatGPT 对话
+0. 退出程序并关闭窗口
+
+请选择 1 / 0（直接回车退出并关闭窗口）：
+```
+
+输入：
+
+```txt
+1
+```
+
+继续导出其他对话。
+
+输入：
+
+```txt
+0
+```
+
+或者直接回车，退出程序。
+
+如果是从资源管理器里双击 `.bat` 启动，正常退出后窗口会自动关闭。  
+如果是在 Cursor / PowerShell 已有终端里运行，脚本只能退出程序，不能关闭你已经打开的终端窗口。
+
+---
+
+## 四、刷新页面列表
+
+选择页面时，如果新打开的 ChatGPT 页面还没显示，可以输入：
+
+```txt
+r
+```
+
+刷新页面列表。
+
+刷新时会显示明显提示：
+
+```txt
+正在刷新页面列表...
+请稍等，刷新完成后会重新显示当前 Chrome 页面。
+```
+
+刷新完成后会显示刷新次数和时间。
+
+---
+
+## 五、设置 PDF 里的用户名
+
+如果 PDF 里用户名称不对，双击：
+
+```txt
+03_设定用户名.bat
+```
+
+输入你想显示的名字。
+
+设置会保存到：
+
+```txt
+pdf_user_name.txt
+```
+
+之后生成 PDF 时会优先使用这个名字。
+
+如果不设置，默认显示：
+
+```txt
+用户
+```
+
+---
+
+## 六、用户端日志和开发者日志
+
+普通用户窗口会尽量保持简洁，只显示关键进度，例如：
+
+```txt
+开始生成 PDF...
+正在生成文件...
+✅ 生成完成
+PDF：...\PDF\xxx.pdf
+网页：...\HTML\xxx.html
+开发者日志：...\logs\pdf_generation_dev_log.txt
+```
+
+详细生成过程会写入开发者日志：
+
+```txt
+logs/pdf_generation_dev_log.txt
+```
+
+主程序完整运行日志在：
+
+```txt
+logs/fresh_export_select_log.txt
+```
+
+如果用户反馈问题，优先让用户发这两个日志：
+
+```txt
+logs/fresh_export_select_log.txt
+logs/pdf_generation_dev_log.txt
+```
+
+---
+
+## 七、图片附件支持
+
+当前版本会尽量导出 ChatGPT 对话里的图片附件。
+
+已经支持：
+
+```txt
+jpg / jpeg / png / webp / gif / bmp / svg / avif / heic / heif / tif / tiff / ico
+```
+
+图片抓取逻辑包括：
+
+```txt
+1. Network 图片资源捕获
+2. DOM 图片兜底
+3. 对应消息内拉取 img/link 附件
+4. file_id 后端接口补抓
+5. 小图附件精确 file_id 匹配
+6. 消息截图兜底
+```
+
+如果图片没有完全读出，排查时需要这些文件：
+
+```txt
+captures/conversation_json.txt
+captures/assets_manifest.json
+captures/page_images_debug.json
+captures/assets/
+logs/fresh_export_select_log.txt
+```
+
+建议打包命令：
+
+```powershell
+Compress-Archive -Path ".\captures\assets_manifest.json", ".\captures\page_images_debug.json", ".\captures\conversation_json.txt", ".\captures\assets", ".\logs\fresh_export_select_log.txt" -DestinationPath ".\debug_export.zip" -Force
+```
+
+---
+
+
+
+
+## 八、保留的第一版方案：Python / Playwright 版本
 
 Python 版本是项目第一版方案，可以继续保留，适合开发者调试或作为备用导出方式。
 
@@ -122,20 +291,31 @@ py export_pdf.py
 ---
 
 
-## 四、文件说明
+## 九、文件说明
 
 ### Node.js 版本文件
 
 | 文件 / 目录 | 作用 |
 |---|---|
-| `双击开始导出PDF.bat` | 普通用户启动入口，双击它开始导出 |
-| `修改PDF保存位置.bat` | 修改 PDF 输出目录 |
-| `run_fresh_export_select_page.js` | 主程序，负责连接 Chrome、选择页面、抓取 conversation JSON |
-| `run_json_to_pdf_pick_output.js` | 负责选择/读取输出目录并调用 PDF 转换逻辑 |
-| `json_to_pdf.js` | 将聊天 JSON 转成 PDF 的核心代码 |
+| `01_双击开始导出PDF.bat` | 普通用户启动入口，双击后开始导出 |
+| `02_修改输出路径工具.bat` | 修改 PDF / HTML 保存位置 |
+| `03_设定用户名.bat` | 设置 PDF 里显示的用户名称 |
+| `04_START_GUI.bat` | GUI 版本启动器，当前属于开发测试入口 |
+| `run_fresh_export_select_page.js` | 主程序，负责连接 Chrome、选择页面、抓取 conversation JSON、抓图片附件 |
+| `run_json_to_pdf_pick_output.js` | 负责读取/选择输出目录，并调用 PDF 转换逻辑 |
+| `json_to_pdf.js` | 将聊天 JSON 转成 HTML 和 PDF 的核心代码 |
+| `set_pdf_user_name.js` | 保存 PDF 用户名配置的脚本 |
 | `package.json` | Node.js 依赖说明 |
 | `package-lock.json` | 锁定依赖版本，保证安装更稳定 |
-| `node_modules/` | npm 安装出来的依赖目录，不建议上传 GitHub |
+| `.gitattributes` | 固定 `.bat` 文件 CRLF 换行，避免 GitHub 下载后乱码 |
+| `.gitignore` | Git 忽略规则，避免提交运行缓存 |
+| `node_modules/` | npm 安装出来的依赖目录 |
+| `logs/` | 运行日志目录，排查问题用 |
+| `output/` | 默认输出目录，保存生成结果 |
+| `pdf_output_dir.txt` | 已保存的输出目录路径 |
+| `pdf_output_config.json` | 已保存的输出目录配置 |
+| `electron_Gui_starter/` | 早期 GUI 启动包备份目录 |
+| `Gui/` | GUI 相关文件目录，当前属于测试功能 |
 
 ### Python 版本文件
 
@@ -157,7 +337,7 @@ py export_pdf.py
 | `chrome_data/` | Python 版本可能使用的 Chrome 用户数据目录 |
 ---
 
-## 五、常见问题
+## 十、常见问题
 
 ### 1. 普通用户应该用哪个版本？
 
@@ -258,7 +438,7 @@ pause
 
 
 
-## 六、免责声明
+## 十一、免责声明
 
 本项目仅用于个人学习、研究和聊天记录备份。
 

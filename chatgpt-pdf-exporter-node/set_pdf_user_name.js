@@ -7,23 +7,29 @@ const OUT = path.join(ROOT, "pdf_user_name.txt");
 
 function cleanName(value) {
   let s = String(value || "")
+    .replace(/\uFEFF/g, "")
     .replace(/\s+/g, " ")
     .trim();
 
-  const planPatterns = [
-    /免费版升级.*$/i,
-    /升级.*$/i,
-    /free\s*plan\s*upgrade.*$/i,
-    /free\s*upgrade.*$/i,
-    /upgrade\s*plan.*$/i,
-    /免费版.*$/i,
-    /free\s*plan.*$/i
+  const cutTokens = [
+    "免费版升级",
+    "免费版",
+    "升级",
+    "Free plan Upgrade",
+    "Free Plan Upgrade",
+    "free plan upgrade",
+    "Free plan",
+    "free plan",
+    "Upgrade",
+    "upgrade"
   ];
 
-  for (const r of planPatterns) {
-    s = s.replace(r, "").trim();
+  for (const token of cutTokens) {
+    const idx = s.toLowerCase().indexOf(token.toLowerCase());
+    if (idx >= 0) s = s.slice(0, idx).trim();
   }
 
+  const lower = s.toLowerCase();
   const badContains = [
     "打开",
     "菜单",
@@ -39,8 +45,6 @@ function cleanName(value) {
     "chatgpt",
     "openai"
   ];
-
-  const lower = s.toLowerCase();
 
   if (!s) return "";
   if (badContains.some(k => lower.includes(k))) return "";

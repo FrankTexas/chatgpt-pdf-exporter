@@ -87,21 +87,43 @@ function getCurrentBranch(data) {
   return chain.reverse();
 }
 
+function sanitizeMessageText(text) {
+  return String(text || "")
+    // 去掉 ChatGPT 内部引用 token，避免 PDF 出现一串看不懂的标记。
+    .replace(/[^]+/g, "")
+    // 去掉 artifact/writing 包装标记，只保留里面正常文本。
+    .replace(/:::writing\{[^}]*\}/g, "")
+    .replace(/:::/g, "")
+    .trim();
+}
+
 function contentText(content) {
   if (!content) return "";
-  if (typeof content === "string") return content;
-  if (content.text) return String(content.text);
+  if (typeof content === "string") return sanitizeMessageText(content);
+  if (content.text) return sanitizeMessageText(content.text);
+
+  function textFromPart(part) {
+    if (typeof part === "string") return part;
+    if (!part || typeof part !== "object") return "";
+
+    // 附件对象不要直接输出 file_id，后面单独用附件卡片渲染。
+    if (part.file_id || part.fileId || part.asset_pointer || part.name || part.filename || part.file_name) {
+      return part.text ? String(part.text || "") : "";
+    }
+
+    if (part.text) return String(part.text || "");
+    if (part.content && typeof part.content === "string") return part.content;
+    if (part.value && typeof part.value === "string") return part.value;
+
+    return "";
+  }
 
   if (Array.isArray(content.parts)) {
-    return content.parts.map(part => {
-      if (typeof part === "string") return part;
-      if (part && typeof part === "object") {
-        // 附件对象不要直接输出 file_id，后面单独用附件卡片渲染。
-        if (part.file_id || part.fileId || part.asset_pointer || part.name || part.filename || part.file_name) return "";
-        if (part.text) return part.text;
-      }
-      return "";
-    }).filter(Boolean).join("\n");
+    return sanitizeMessageText(content.parts.map(textFromPart).filter(Boolean).join("\n"));
+  }
+
+  if (Array.isArray(content.content)) {
+    return sanitizeMessageText(content.content.map(textFromPart).filter(Boolean).join("\n"));
   }
 
   return "";
@@ -206,16 +228,52 @@ function findAssetForAttachment(att, manifest) {
   const byId = manifest.filesById || {};
   const byName = manifest.filesByName || {};
 
-  if (att.fileId && byId[att.fileId]) return byId[att.fileId];
+  // 关键修复：有 file_id 的附件必须按 file_id 精确匹配。
+  // 不能再 fallback 到 image.png 这种重复文件名，否则会把同一张图重复插到多个附件里。
+  if (att.fileId) return byId[att.fileId] || null;
+
   if (att.name && byName[att.name]) return byName[att.name];
 
   return null;
 }
 
+function mimeFromExt(filePath) {
+  const ext = String(path.extname(filePath || "") || "").toLowerCase();
+
+  if (ext === ".jpg" || ext === ".jpeg") return "image/jpeg";
+  if (ext === ".png") return "image/png";
+  if (ext === ".webp") return "image/webp";
+  if (ext === ".gif") return "image/gif";
+  if (ext === ".bmp") return "image/bmp";
+  if (ext === ".svg") return "image/svg+xml";
+  if (ext === ".avif") return "image/avif";
+  if (ext === ".heic") return "image/heic";
+  if (ext === ".heif") return "image/heif";
+  if (ext === ".tif" || ext === ".tiff") return "image/tiff";
+  if (ext === ".ico") return "image/x-icon";
+
+  return "application/octet-stream";
+}
+
 function assetSrc(asset) {
   if (!asset) return "";
+
+  const localPath = asset.localPath && fs.existsSync(asset.localPath)
+    ? asset.localPath
+    : "";
+
+  if (localPath) {
+    try {
+      const mime = asset.mimeType || mimeFromExt(localPath);
+      const base64 = fs.readFileSync(localPath).toString("base64");
+      return `data:${mime};base64,${base64}`;
+    } catch (_) {}
+  }
+
+  // 兜底：如果本地图片不存在，才退回 file://。
+  // 正常导出的 HTML 会优先用 data URL，这样单独打开/分享 HTML 时图片不会丢。
   if (asset.fileUrl) return asset.fileUrl;
-  if (asset.localPath && fs.existsSync(asset.localPath)) return pathToFileUrl(asset.localPath);
+
   return "";
 }
 
@@ -241,16 +299,41 @@ function renderMarkdownish(text) {
   return `<div class="markdown"><p>${html}</p></div>`;
 }
 
+function attachmentIdentity(att, manifest) {
+  const asset = findAssetForAttachment(att, manifest);
+
+  if (asset) {
+    return [
+      "asset",
+      asset.localPath || "",
+      asset.fileUrl || "",
+      asset.relativeToCaptureDir || "",
+      asset.bytes || ""
+    ].join("|");
+  }
+
+  return [
+    "att",
+    att.fileId || "",
+    att.name || "",
+    att.mimeType || ""
+  ].join("|");
+}
+
 function renderAttachment(att, manifest) {
   const asset = findAssetForAttachment(att, manifest);
   const name = att.name || "未命名附件";
 
   if (att.isImage && asset) {
     const src = assetSrc(asset);
+
     if (src) {
+      const isScreenshot = String(asset.source || "").includes("screenshot");
+
       return `
         <div class="media-list">
-          <div class="file-chip image-chip">
+          <div class="file-chip image-chip ${isScreenshot ? "screenshot-fallback" : ""}">
+            ${isScreenshot ? `<div class="image-note">原图未能直接下载，已使用消息截图兜底。</div>` : ""}
             <img src="${escapeHtml(src)}" alt="${escapeHtml(name)}" />
           </div>
         </div>`;
@@ -261,8 +344,7 @@ function renderAttachment(att, manifest) {
     return `
       <div class="media-list">
         <div class="file-chip image-missing">
-          <small>图片未能嵌入，只保留附件记录。</small>
-          ${att.fileId ? `<br><small>${escapeHtml(att.fileId)}</small>` : ""}
+          <small>图片未捕获：${escapeHtml(name)}</small>
         </div>
       </div>`;
   }
@@ -306,40 +388,45 @@ function buildMessages(data, manifest) {
 
 function cleanDisplayNameForPdf(value) {
   let s = String(value || "")
+    .replace(/\uFEFF/g, "")
     .replace(/\s+/g, " ")
     .trim();
 
   if (!s) return "";
 
-  const planPatterns = [
-    /免费版升级.*$/i,
-    /升级.*$/i,
-    /free\s*plan\s*upgrade.*$/i,
-    /free\s*upgrade.*$/i,
-    /upgrade\s*plan.*$/i,
-    /plus\s*upgrade.*$/i,
-    /go\s*upgrade.*$/i,
-    /pro\s*upgrade.*$/i,
-    /team\s*upgrade.*$/i,
-    /enterprise\s*upgrade.*$/i,
-    /免费版.*$/i,
-    /free\s*plan.*$/i,
-    /plus\s*plan.*$/i,
-    /go\s*plan.*$/i,
-    /pro\s*plan.*$/i,
-    /team\s*plan.*$/i,
-    /enterprise\s*plan.*$/i
+  const cutTokens = [
+    "免费版升级",
+    "免费版",
+    "升级",
+    "Free plan Upgrade",
+    "Free Plan Upgrade",
+    "free plan upgrade",
+    "Free plan",
+    "Free Plan",
+    "free plan",
+    "Upgrade plan",
+    "upgrade plan",
+    "Upgrade",
+    "upgrade",
+    "Plus plan",
+    "plus plan",
+    "Go plan",
+    "go plan",
+    "Pro plan",
+    "pro plan",
+    "Team plan",
+    "team plan",
+    "Enterprise plan",
+    "enterprise plan"
   ];
 
-  for (const r of planPatterns) {
-    s = s.replace(r, "").trim();
+  for (const token of cutTokens) {
+    const idx = s.toLowerCase().indexOf(token.toLowerCase());
+    if (idx >= 0) s = s.slice(0, idx).trim();
   }
 
-  s = s
-    .replace(/[|｜·•\-–—]\s*(免费版|升级|free|upgrade|plus|go|pro|team|enterprise).*$/i, "")
-    .trim();
-
   const lower = s.toLowerCase();
+
   const badContains = [
     "打开",
     "菜单",
@@ -379,8 +466,16 @@ function readConfiguredDisplayNameForPdf() {
   for (const p of candidates) {
     try {
       if (!fs.existsSync(p)) continue;
-      const name = cleanDisplayNameForPdf(fs.readFileSync(p, "utf8").replace(/^\uFEFF/, ""));
-      if (name) return name;
+
+      const raw = fs.readFileSync(p, "utf8").replace(/^\uFEFF/, "");
+      const name = cleanDisplayNameForPdf(raw);
+
+      if (name) {
+        if (String(raw || "").trim() !== name && path.basename(p).toLowerCase() === "pdf_user_name.txt") {
+          fs.writeFileSync(p, name + "\n", "utf8");
+        }
+        return name;
+      }
     } catch (_) {}
   }
 
@@ -388,16 +483,10 @@ function readConfiguredDisplayNameForPdf() {
 }
 
 function getExportUserName(manifest) {
+  // 自动猜用户名不稳定，可能抓到项目名、GPT 名或升级按钮。
+  // PDF 里只使用用户手动设置的名字；未设置时显示“用户”。
   const configured = readConfiguredDisplayNameForPdf();
-  if (configured) return configured;
-
-  const name = cleanDisplayNameForPdf(
-    manifest?.userDisplayName ||
-    manifest?.exportMetadata?.userDisplayName ||
-    ""
-  );
-
-  return name || "用户";
+  return configured || "用户";
 }
 
 function formatExportTimeOnly() {
@@ -413,7 +502,18 @@ function buildHtml(data, messages, manifest) {
     const roleName = message.role === "user" ? exportUserName : "ChatGPT";
     const roleClass = message.role === "user" ? "user" : "assistant";
     const textHtml = message.text ? renderMarkdownish(message.text) : "";
-    const attachmentsHtml = message.attachments.map(a => renderAttachment(a, manifest)).join("\n");
+
+    const seenAttachments = new Set();
+    const uniqueAttachments = [];
+
+    for (const att of message.attachments || []) {
+      const key = attachmentIdentity(att, manifest);
+      if (seenAttachments.has(key)) continue;
+      seenAttachments.add(key);
+      uniqueAttachments.push(att);
+    }
+
+    const attachmentsHtml = uniqueAttachments.map(a => renderAttachment(a, manifest)).join("\n");
 
     return `
       <article class="message ${roleClass}">
@@ -604,6 +704,16 @@ function buildHtml(data, messages, manifest) {
     object-fit: contain;
   }
 
+  .image-note {
+    margin-bottom: 8px;
+    font-size: 13px;
+    color: #6b7280;
+  }
+
+  .screenshot-fallback img {
+    border-style: dashed;
+  }
+
   @page {
     size: A4;
     margin: 14mm 16mm;
@@ -709,33 +819,43 @@ function resolveOutputDir(argvOutputDir) {
 }
 
 async function convertJsonToPdf(options = {}) {
+  const logger = typeof options.logger === "function" ? options.logger : log;
+
   const jsonPath = path.resolve(options.jsonPath || DEFAULT_JSON_PATH);
   const outputDir = path.resolve(resolveOutputDir(options.outputDir));
+  const pdfDir = path.resolve(options.pdfDir || path.join(outputDir, "PDF"));
+  const htmlDir = path.resolve(options.htmlDir || path.join(outputDir, "HTML"));
 
-  log("读取文件：" + jsonPath);
-  log("输出文件夹：" + outputDir);
+  logger("读取文件：" + jsonPath);
+  logger("输出根目录：" + outputDir);
+  logger("PDF 输出目录：" + pdfDir);
+  logger("HTML 输出目录：" + htmlDir);
 
-  fs.mkdirSync(outputDir, { recursive: true });
+  fs.mkdirSync(pdfDir, { recursive: true });
+  fs.mkdirSync(htmlDir, { recursive: true });
 
   const data = readConversation(jsonPath);
   const manifest = loadAssetsManifest(jsonPath);
   const messages = buildMessages(data, manifest);
 
+  logger("标题：" + (data.title || "ChatGPT对话"));
+  logger("消息数：" + messages.length);
+
   const title = safeFilename(data.title || "ChatGPT对话", "ChatGPT对话");
   const stamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d+Z$/, "").replace("T", "_");
   const base = `${title}_${stamp}`;
-  const htmlPath = path.join(outputDir, base + ".html");
-  const pdfPath = path.join(outputDir, base + ".pdf");
+  const htmlPath = path.join(htmlDir, base + ".html");
+  const pdfPath = path.join(pdfDir, base + ".pdf");
 
-  log("生成 HTML：" + htmlPath);
+  logger("生成 HTML：" + htmlPath);
   const html = buildHtml(data, messages, manifest);
   fs.writeFileSync(htmlPath, html, "utf8");
 
-  log("生成 PDF：" + pdfPath);
+  logger("生成 PDF：" + pdfPath);
   await htmlToPdf(htmlPath, pdfPath);
 
-  log("完成：" + pdfPath);
-  return { htmlPath, pdfPath, messageCount: messages.length };
+  logger("完成：" + pdfPath);
+  return { htmlPath, pdfPath, messageCount: messages.length, pdfDir, htmlDir, outputDir };
 }
 
 async function main() {

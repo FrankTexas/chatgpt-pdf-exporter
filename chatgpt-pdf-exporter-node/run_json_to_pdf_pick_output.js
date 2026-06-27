@@ -7,6 +7,8 @@ const DEFAULT_JSON = path.join(ROOT, "captures", "conversation_json.txt");
 const DEFAULT_OUTPUT = path.join(ROOT, "output");
 const OUTPUT_TEXT_FILE = path.join(ROOT, "pdf_output_dir.txt");
 const OUTPUT_JSON_FILE = path.join(ROOT, "pdf_output_config.json");
+const LOG_DIR = path.join(ROOT, "logs");
+const PDF_DEV_LOG_FILE = path.join(LOG_DIR, "pdf_generation_dev_log.txt");
 
 function log(...args) {
   console.log(args.join(" "));
@@ -19,6 +21,21 @@ function warn(...args) {
 function ok(...args) {
   console.log("✅", args.join(" "));
 }
+
+function ensureDevLog() {
+  fs.mkdirSync(LOG_DIR, { recursive: true });
+}
+
+function resetDevLog() {
+  ensureDevLog();
+  fs.writeFileSync(PDF_DEV_LOG_FILE, "", "utf8");
+}
+
+function devLog(...args) {
+  ensureDevLog();
+  fs.appendFileSync(PDF_DEV_LOG_FILE, args.join(" ") + "\n", "utf8");
+}
+
 
 function readTextIfExists(p) {
   try {
@@ -280,10 +297,13 @@ async function main() {
     return;
   }
 
-  log("========================================");
-  log("JSON To PDF - 选择输出位置版");
-  log("========================================");
-  log("");
+  resetDevLog();
+  devLog("========================================");
+  devLog("JSON To PDF - developer log");
+  devLog("========================================");
+  devLog("时间：" + new Date().toISOString());
+  devLog("项目目录：" + ROOT);
+  devLog("JSON 文件：" + DEFAULT_JSON);
 
   if (!fs.existsSync(DEFAULT_JSON)) {
     throw new Error("找不到 conversation_json.txt：" + DEFAULT_JSON);
@@ -294,30 +314,50 @@ async function main() {
   });
 
   const outputDir = normalizeOutputDir(resultDir.dir);
-  fs.mkdirSync(outputDir, { recursive: true });
+  const pdfDir = path.join(outputDir, "PDF");
+  const htmlDir = path.join(outputDir, "HTML");
 
-  log("输出文件夹：");
-  log(outputDir);
-  log("来源：" + resultDir.source);
-  log("");
-  log("开始生成 PDF...");
-  log("");
+  fs.mkdirSync(pdfDir, { recursive: true });
+  fs.mkdirSync(htmlDir, { recursive: true });
+
+  devLog("输出根目录：" + outputDir);
+  devLog("PDF 输出目录：" + pdfDir);
+  devLog("HTML 输出目录：" + htmlDir);
+  devLog("输出来源：" + resultDir.source);
+  devLog("");
+
+  log("正在生成文件...");
 
   const convertJsonToPdf = require("./json_to_pdf.js");
   const result = await convertJsonToPdf({
     jsonPath: DEFAULT_JSON,
-    outputDir
+    outputDir,
+    pdfDir,
+    htmlDir,
+    logger: (...args) => devLog(...args)
   });
 
-  log("");
-  log("生成完成：");
-  log(result.pdfPath);
-  log(result.htmlPath);
+  ok("生成完成");
+  log("PDF：" + result.pdfPath);
+  log("网页：" + result.htmlPath);
+  log("开发者日志：" + PDF_DEV_LOG_FILE);
+
+  devLog("");
+  devLog("生成完成：");
+  devLog("PDF：" + result.pdfPath);
+  devLog("HTML：" + result.htmlPath);
 }
 
 main().catch(err => {
+  const msg = err.stack || err.message || String(err);
+  try {
+    devLog("");
+    devLog("PDF 生成失败：");
+    devLog(msg);
+  } catch (_) {}
+
   console.error("");
-  console.error("PDF 生成失败：");
-  console.error(err.stack || err.message || String(err));
+  console.error("PDF 生成失败，详情见开发者日志：");
+  console.error(PDF_DEV_LOG_FILE);
   process.exit(1);
 });
